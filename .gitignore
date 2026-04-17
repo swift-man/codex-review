@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.env.*
+!.env.example
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.log
+.DS_Store
+
+# local secret env files (실명 + 일반 패턴 양쪽 방어)
+scripts/local_review_env.sh
+scripts/*_env.sh
+!scripts/local_review_env.example.sh
+
+# private keys / credentials (어디에 두든 커밋 금지)
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# runtime caches
+repos_cache/
+.codex-review/
