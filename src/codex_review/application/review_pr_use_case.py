@@ -29,6 +29,9 @@ class ReviewPullRequestUseCase:
 
         dump = self._file_collector.collect(repo_path, pr.changed_files, self._budget)
 
+        # 변경 파일이 예산 때문에 잘려 나갔다면 "전체 리뷰"가 성립하지 않는다. 저품질 리뷰를
+        # 게시하느니 리뷰를 건너뛰고 운영자에게 조치 방법을 안내 코멘트로 남긴다.
+        # 변경 파일이 모두 들어간 경우(잘려도 비변경 파일만 제외)는 그대로 리뷰를 수행한다.
         if dump.exceeded_budget and _changed_missing(pr, dump):
             logger.warning(
                 "budget exceeded for %s#%d — skipping review, posting notice",

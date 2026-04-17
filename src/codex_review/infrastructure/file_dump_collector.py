@@ -98,9 +98,13 @@ class FileDumpCollector:
         changed_files: tuple[str, ...],
         budget: TokenBudget,
     ) -> FileDump:
+        # git ls-files 로 .gitignore 를 존중하는 "진짜 소스" 파일만 뽑는다.
+        # 레포 루트 파일을 os.walk 로 순회하면 로컬 빌드 산출물까지 섞여 들어온다.
         tracked = _git_ls_files(root)
         changed_set = set(changed_files)
 
+        # 변경 파일 → 핵심 소스 디렉터리 → 기타 순으로 정렬하는 이유:
+        # 예산이 부족할 때 하위 우선순위 파일부터 잘라내야 PR 컨텍스트가 살아남는다.
         ordered = _sort_by_priority(tracked, changed_set)
 
         entries: list[FileEntry] = []
@@ -121,7 +125,9 @@ class FileDumpCollector:
                 excluded.append(rel_path)
                 continue
 
-            entry_chars = len(content) + len(rel_path) + 32  # framing overhead
+            # 32자 여유는 프롬프트에 붙는 "--- FILE: path ---" / 라인 번호 접두사 등
+            # 프레이밍 오버헤드 근사치. 정확한 토큰 산정은 아니지만 보수적으로 잡아 예산 초과를 막는다.
+            entry_chars = len(content) + len(rel_path) + 32
             if total_chars + entry_chars > max_chars:
                 excluded.append(rel_path)
                 continue
@@ -136,6 +142,10 @@ class FileDumpCollector:
             )
             total_chars += entry_chars
 
+        # exceeded 판정 기준:
+        # (1) 변경 파일 중 하나라도 예산 때문에 제외됐다면 → 리뷰 품질이 크게 떨어지므로 exceeded
+        # (2) 전체 예산을 꽉 채웠다면(>=)  → 프롬프트 뒤쪽이 잘렸을 가능성 높음
+        # use case 레이어에서 (1)에 해당하는 경우에만 리뷰 대신 "예산 초과" 코멘트를 게시.
         exceeded = any(p for p in excluded if p in changed_set) or total_chars >= max_chars
         return FileDump(
             entries=tuple(entries),

@@ -77,6 +77,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/webhook")
     async def webhook(request: Request) -> Response:
+        # 1) raw body 를 먼저 읽는다. 서명 검증은 원문 바이트에 대해서만 유효하므로
+        #    json.loads 이후 재직렬화한 값으로 계산하면 안 된다.
         body = await request.body()
         signature = request.headers.get("X-Hub-Signature-256")
         if not handler.verify_signature(signature, body):
@@ -91,6 +93,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         event = request.headers.get("X-GitHub-Event", "")
         delivery = request.headers.get("X-GitHub-Delivery", "-")
 
+        # 2) accept() 는 필터링 후 큐에 넣고 즉시 반환한다. GitHub 는 10초 내 응답이 없으면
+        #    webhook 을 실패 처리하므로, 무거운 리뷰 작업은 워커 스레드에서 진행한다.
         status, reason = handler.accept(event, delivery, payload)
         return Response(status_code=status, content=reason)
 
