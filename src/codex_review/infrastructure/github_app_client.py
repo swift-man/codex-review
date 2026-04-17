@@ -40,6 +40,8 @@ class GitHubAppClient:
     # --- Auth ---------------------------------------------------------------
 
     def _app_jwt(self) -> str:
+        # iat 를 30초 과거로 당기고 exp 를 10분 한도(GitHub 제한)에 못 미치는 9분으로 잡는 건
+        # 로컬-GitHub 간 시계 오차로 인한 "JWT not yet valid / expired" 실패를 피하기 위함.
         now = int(time.time())
         payload = {"iat": now - 30, "exp": now + 9 * 60, "iss": str(self._app_id)}
         return jwt.encode(payload, self._private_key, algorithm="RS256")
@@ -53,7 +55,8 @@ class GitHubAppClient:
         data = self._request("POST", url, auth=f"Bearer {self._app_jwt()}")
         token = str(data["token"])
         expires = data.get("expires_at", "")
-        expires_at = time.time() + 55 * 60  # GitHub tokens live ~1h, keep margin.
+        # GitHub installation token 은 1시간 유효. 만료 직전 요청이 실패하지 않도록 5분 여유.
+        expires_at = time.time() + 55 * 60
         if expires:
             try:
                 expires_at = time.mktime(time.strptime(expires, "%Y-%m-%dT%H:%M:%SZ"))
@@ -71,6 +74,8 @@ class GitHubAppClient:
         pr_url = f"{self._api_base}/repos/{repo.full_name}/pulls/{number}"
         pr_data = self._request("GET", pr_url, auth=f"token {token}")
 
+        # 변경 파일 전체를 가져와야 우선순위 정렬(변경 파일 먼저)이 정확해진다.
+        # per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
         files_url = f"{pr_url}/files?per_page=100"
         changed: list[str] = []
         page = 1
@@ -79,6 +84,7 @@ class GitHubAppClient:
             if not isinstance(files, list) or not files:
                 break
             changed.extend(str(f["filename"]) for f in files)
+            # 100개 미만이면 마지막 페이지 — Link 헤더 대신 길이로 단순 판정.
             if len(files) < 100:
                 break
             page += 1
@@ -107,6 +113,8 @@ class GitHubAppClient:
 
         token = self.get_installation_token(pr.installation_id)
         url = f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}/reviews"
+        # commit_id 를 명시해야 리뷰가 "이 head SHA 시점"에 고정된다. 생략하면 최신 SHA 기준으로
+        # 붙어 라인 번호 오정렬이 발생할 수 있다.
         payload: dict[str, object] = {
             "commit_id": pr.head_sha,
             "body": result.render_body(),

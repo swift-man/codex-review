@@ -38,7 +38,9 @@ def _extract_json(text: str) -> dict[str, object] | None:
         except json.JSONDecodeError:
             pass
 
-    # Prefer the LAST complete JSON object (Codex may emit reasoning first).
+    # Codex agentic 실행은 "추론 → 최종 답" 순서로 여러 JSON 조각을 내뱉을 수 있다.
+    # 예: 중간에 `{"note": "..."}` 같은 로그 성격의 JSON 이 섞여도 최종 리뷰 JSON 은 맨 뒤.
+    # 따라서 뒤에서부터 훑으며 "summary" 키를 가진 첫 후보를 리뷰 결과로 채택한다.
     candidates = _JSON_BLOCK.findall(text)
     for candidate in reversed(candidates):
         try:
@@ -68,9 +70,9 @@ def _parse_findings(raw: object) -> list[Finding]:
         path = str(item.get("path", "")).strip()
         body = str(item.get("body", "")).strip()
         line = _coerce_line(item.get("line"))
+        # 라인 번호가 없는 지적은 PR 인라인 코멘트로 붙을 수 없다. 제품 스펙상 "라인 고정 기술 단위
+        # 코멘트"만 인라인 대상이며, 나머지 거시적 지적은 improvements 섹션으로 모델이 분류해야 한다.
         if not path or not body or line is None:
-            # A finding without a concrete line number cannot be attached
-            # inline, so we drop it per product spec.
             continue
         out.append(Finding(path=path, line=line, body=body))
     return out

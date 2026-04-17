@@ -63,11 +63,15 @@ class CodexCliEngine:
 
     def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
         prompt = build_prompt(pr, dump)
+        # "-" positional: Codex CLI 에 stdin 에서 프롬프트를 읽도록 지시.
+        # argv 로 넘기지 않는 이유는 전체 레포 덤프가 수백 KB ~ 수 MB 라 ARG_MAX 를 초과할 수 있어서.
         cmd = [
             self._binary,
             "exec",
             "--model",
             self._model,
+            # reasoning_effort 는 config 오버라이드로 넘긴다. `codex exec` 가 별도 CLI 플래그로
+            # 지원하지 않고 ~/.codex/config.toml 값만 읽기 때문에 `-c key=value` 가 정석 경로.
             "--config",
             f"model_reasoning_effort={self._reasoning_effort}",
             "-",

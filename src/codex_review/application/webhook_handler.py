@@ -57,9 +57,12 @@ class WebhookHandler:
     # --- Verification -------------------------------------------------------
 
     def verify_signature(self, signature_header: str | None, body: bytes) -> bool:
+        # 원문 body 로 HMAC 을 계산해야 함. json.loads 후 재직렬화하면 키 순서/공백 차이로
+        # 서명이 달라져 정상 요청을 거부하게 된다. 따라서 검증은 반드시 raw bytes 단계에서.
         if not signature_header or not signature_header.startswith("sha256="):
             return False
         expected = hmac.new(self._secret, body, hashlib.sha256).hexdigest()
+        # hmac.compare_digest 는 타이밍 공격 방지용 상수-시간 비교.
         return hmac.compare_digest(signature_header.removeprefix("sha256="), expected)
 
     # --- Dispatch -----------------------------------------------------------
@@ -83,6 +86,8 @@ class WebhookHandler:
             return 202, "ignored-action"
 
         pr = payload.get("pull_request") or {}
+        # webhook payload 의 draft 값과 실제 처리 시점의 PR 상태가 다를 수 있어
+        # _process() 에서 한 번 더 확인한다(여기선 큐 진입 전 1차 필터).
         if bool(pr.get("draft")):
             dlog.info("skipping draft PR")
             return 202, "skipped-draft"
@@ -117,8 +122,13 @@ class WebhookHandler:
     # --- Worker -------------------------------------------------------------
 
     def _run(self) -> None:
+        # 완전 직렬화: 한 번에 한 리뷰만 돌린다(동시성 1). 이유는 Codex CLI 가 사용자 ChatGPT
+        # OAuth 를 공유하므로 동시 호출은 rate-limit 에 걸릴 위험이 크고, `codex exec` 가 리뷰 하나당
+        # 수 분 수준이라 큐가 길어져도 순차 처리가 운영상 단순하기 때문.
         while not self._stop.is_set():
             try:
+                # timeout 으로 주기적으로 깨어나 _stop 을 확인. 이렇게 해야 서버 종료 시 블로킹 없이
+                # 스레드가 빠져나온다.
                 job = self._queue.get(timeout=1.0)
             except queue.Empty:
                 continue
