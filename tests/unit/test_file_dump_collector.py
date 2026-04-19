@@ -67,3 +67,121 @@ def test_collect_marks_exceeded_when_changed_file_excluded(repo: Path) -> None:
     )
     assert dump.exceeded_budget is True
     assert "big.py" in dump.excluded
+
+
+def _commit_all(repo: Path) -> None:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "x")
+
+
+def test_collect_skips_ios_project_meta(repo: Path) -> None:
+    # iOS 프로젝트 메타 파일들이 확장자 기반으로 제외되는지
+    (repo / "App.xcodeproj").mkdir()
+    (repo / "App.xcodeproj" / "project.pbxproj").write_text("// big", encoding="utf-8")
+    (repo / "View.storyboard").write_text("<xml/>", encoding="utf-8")
+    (repo / "View.xib").write_text("<xml/>", encoding="utf-8")
+    (repo / "ko.lproj").mkdir()
+    (repo / "ko.lproj" / "Localizable.strings").write_text('"k" = "v";', encoding="utf-8")
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(10_000))
+    paths = [e.path for e in dump.entries]
+
+    assert not any(p.endswith(".pbxproj") for p in paths)
+    assert not any(p.endswith(".storyboard") for p in paths)
+    assert not any(p.endswith(".xib") for p in paths)
+    assert not any(p.endswith(".strings") for p in paths)
+
+
+def test_collect_skips_ios_build_dirs(repo: Path) -> None:
+    for d in ("Pods", "Carthage", ".build", "DerivedData"):
+        (repo / d).mkdir()
+        (repo / d / "x.swift").write_text("// noise", encoding="utf-8")
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(10_000))
+    paths = [e.path for e in dump.entries]
+
+    for d in ("Pods", "Carthage", ".build", "DerivedData"):
+        assert not any(p.startswith(f"{d}/") for p in paths)
+
+
+def test_collect_skips_xcassets_bundle(repo: Path) -> None:
+    (repo / "Assets.xcassets").mkdir()
+    (repo / "Assets.xcassets" / "Contents.json").write_text("{}", encoding="utf-8")
+    (repo / "Assets.xcassets" / "nested").mkdir()
+    (repo / "Assets.xcassets" / "nested" / "info.json").write_text("{}", encoding="utf-8")
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(10_000))
+    paths = [e.path for e in dump.entries]
+    assert not any("Assets.xcassets" in p for p in paths)
+
+
+def test_collect_skips_snapshots_and_fixtures(repo: Path) -> None:
+    (repo / "__snapshots__").mkdir()
+    (repo / "__snapshots__" / "App.test.ts.snap").write_text("snap", encoding="utf-8")
+    (repo / "tests").mkdir(exist_ok=True)
+    (repo / "tests" / "fixtures").mkdir()
+    (repo / "tests" / "fixtures" / "data.json").write_text("{}", encoding="utf-8")
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(10_000))
+    paths = [e.path for e in dump.entries]
+    assert not any("__snapshots__" in p for p in paths)
+    assert not any("fixtures" in p for p in paths)
+
+
+def test_smart_filter_keeps_small_json_and_known_config(repo: Path) -> None:
+    # 작은 JSON, 알려진 설정 이름(package.json) — 둘 다 포함돼야 함.
+    # 25KB 로 데이터 상한(20KB)은 넘지만 화이트리스트라 통과해야 한다.
+    (repo / "small.json").write_text('{"a": 1}', encoding="utf-8")
+    (repo / "package.json").write_text('{"name": "x"}' + " " * 25_000, encoding="utf-8")
+    # 같은 크기의 일반 JSON — 데이터 상한 초과 → 제외
+    (repo / "locales.json").write_text('{"k": "v"}' + " " * 25_000, encoding="utf-8")
+    _commit_all(repo)
+
+    # budget 을 넉넉히 잡아 예산 초과가 아닌 data-limit 만 단독 검증
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024, data_file_max_bytes=20_000)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(1_000_000))
+    paths = [e.path for e in dump.entries]
+
+    assert "small.json" in paths
+    assert "package.json" in paths  # 화이트리스트 이름은 data_file 크기 제한 무시
+    assert "locales.json" not in paths  # 이름 없고 크면 제외
+
+
+def test_smart_filter_applies_to_yaml_and_xml(repo: Path) -> None:
+    (repo / "app.yaml").write_text("k: v\n" + ("x" * 30_000), encoding="utf-8")
+    (repo / "config.xml").write_text("<xml/>" + ("x" * 30_000), encoding="utf-8")
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024, data_file_max_bytes=20_000)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(100_000))
+    paths = [e.path for e in dump.entries]
+
+    # 모호한 확장자라서 데이터 상한에 걸림
+    assert "app.yaml" not in paths
+    assert "config.xml" not in paths
+
+
+def test_min_json_is_skipped(repo: Path) -> None:
+    (repo / "dict.min.json").write_text('{"a":1}', encoding="utf-8")
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(10_000))
+    assert "dict.min.json" not in [e.path for e in dump.entries]
+
+
+def test_package_resolved_is_skipped(repo: Path) -> None:
+    (repo / "Package.resolved").write_text("{}", encoding="utf-8")
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(10_000))
+    assert "Package.resolved" not in [e.path for e in dump.entries]

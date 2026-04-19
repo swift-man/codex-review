@@ -28,6 +28,7 @@ class Settings(BaseSettings):
         default=Path.home() / ".codex-review" / "repos", alias="REPO_CACHE_DIR"
     )
     file_max_bytes: int = Field(default=204_800, alias="FILE_MAX_BYTES")
+    data_file_max_bytes: int = Field(default=20_000, alias="DATA_FILE_MAX_BYTES")
 
     # Server
     host: str = Field(default="127.0.0.1", alias="HOST")

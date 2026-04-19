@@ -25,7 +25,10 @@ def build_handler(settings: Settings) -> WebhookHandler:
         dry_run=settings.dry_run,
     )
     repo_fetcher = GitRepoFetcher(cache_dir=settings.repo_cache_dir)
-    collector = FileDumpCollector(file_max_bytes=settings.file_max_bytes)
+    collector = FileDumpCollector(
+        file_max_bytes=settings.file_max_bytes,
+        data_file_max_bytes=settings.data_file_max_bytes,
+    )
     engine = CodexCliEngine(
         binary=settings.codex_bin,
         model=settings.codex_model,

@@ -21,6 +21,8 @@ export CODEX_TIMEOUT_SEC="600"
 # --- Repo cache / files ---
 export REPO_CACHE_DIR="$HOME/.codex-review/repos"
 export FILE_MAX_BYTES="204800"
+# JSON/YAML/XML 같은 모호한 확장자에 대한 더 엄격한 상한 (설정/매니페스트 이름은 예외로 항상 포함).
+export DATA_FILE_MAX_BYTES="20000"
 
 # --- Server ---
 export HOST="127.0.0.1"

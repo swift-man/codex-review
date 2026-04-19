@@ -7,6 +7,7 @@ from codex_review.domain import FileDump, FileEntry, TokenBudget
 logger = logging.getLogger(__name__)
 
 _ALWAYS_SKIP_DIRS = {
+    # VCS / Python / JS 공통
     ".git",
     "node_modules",
     "dist",
@@ -27,13 +28,28 @@ _ALWAYS_SKIP_DIRS = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    # iOS / Swift 의존성·빌드 산출물 (코드 리뷰와 무관, 용량 큼)
+    "Pods",
+    "Carthage",
+    ".build",
+    "DerivedData",
+    # 테스트 스냅샷/픽스처 — 자동 생성되거나 덤프성 데이터라 리뷰 가치 낮음
+    "__snapshots__",
+    "snapshots",
+    "__fixtures__",
+    "fixtures",
+    # Storybook 빌드 산출물
+    ".storybook",
+    "storybook-static",
 }
 
 _SKIP_SUFFIXES = {
+    # 번들/생성물
     ".lock",
     ".min.js",
     ".min.css",
     ".map",
+    # 이미지/미디어
     ".png",
     ".jpg",
     ".jpeg",
@@ -42,20 +58,24 @@ _SKIP_SUFFIXES = {
     ".webp",
     ".svg",
     ".pdf",
+    # 압축
     ".zip",
     ".tar",
     ".gz",
     ".bz2",
     ".7z",
+    # 폰트
     ".woff",
     ".woff2",
     ".ttf",
     ".otf",
     ".eot",
+    # 미디어
     ".mp3",
     ".mp4",
     ".mov",
     ".avi",
+    # 바이너리
     ".dll",
     ".so",
     ".dylib",
@@ -69,6 +89,30 @@ _SKIP_SUFFIXES = {
     ".class",
     ".jar",
     ".wasm",
+    # 데이터 테이블 (리뷰 대상 아님)
+    ".csv",
+    ".tsv",
+    ".parquet",
+    ".xlsx",
+    ".xls",
+    # 번역 리소스
+    ".po",
+    ".mo",
+    ".xliff",
+    ".strings",
+    ".stringsdict",
+    # iOS 프로젝트/UI 메타 (거의 생성 파일)
+    ".pbxproj",
+    ".xcworkspacedata",
+    ".xcscheme",
+    ".entitlements",
+    ".storyboard",
+    ".xib",
+    # 스냅샷 개별 파일
+    ".snap",
+    ".snapshot",
+    # 증분 빌드 메타
+    ".tsbuildinfo",
 }
 
 _LOCK_FILENAMES = {
@@ -81,16 +125,65 @@ _LOCK_FILENAMES = {
     "Gemfile.lock",
     "composer.lock",
     "go.sum",
+    # Swift Package Manager
+    "Package.resolved",
 }
 
 _PRIORITY_DIRS = ("src", "app", "lib", "pkg", "internal", "packages", "apps")
+
+# 확장자만으로는 리뷰 가치를 단정할 수 없는(= 소스일 수도 데이터일 수도 있는) 형식.
+# 이 집합에 포함된 파일은 "크면 제외, 작으면 포함" 규칙(_data_file_max_bytes)을 따른다.
+_AMBIGUOUS_DATA_SUFFIXES = {
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".plist",
+    ".ndjson",
+    ".jsonl",
+}
+
+# 크기와 무관하게 항상 포함해야 할 대표적 설정·매니페스트 파일명.
+# 이름에 확신이 있을 때만 `_AMBIGUOUS_DATA_SUFFIXES` 의 크기 제한을 건너뛴다.
+_IMPORTANT_CONFIG_NAMES = {
+    # 프로젝트 매니페스트
+    "package.json",
+    "package.json5",
+    "deno.json",
+    "bun.json",
+    "composer.json",
+    "tsconfig.json",
+    "tsconfig.base.json",
+    "jsconfig.json",
+    # 린트/포매터/빌더
+    "eslint.config.json",
+    ".eslintrc.json",
+    ".prettierrc.json",
+    "biome.json",
+    "babel.config.json",
+    "jest.config.json",
+    # CI / 컨테이너
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    # Python / Rust / Go (*.toml/yaml 도 섞이지만 여기선 대표만)
+    "pyproject.toml",
+    "Cargo.toml",
+    "Package.swift",
+}
 
 
 class FileDumpCollector:
     """Collects repository files into a prioritized dump honoring a token budget."""
 
-    def __init__(self, file_max_bytes: int) -> None:
+    def __init__(
+        self,
+        file_max_bytes: int,
+        data_file_max_bytes: int = 20_000,
+    ) -> None:
         self._file_max_bytes = file_max_bytes
+        # JSON/YAML/XML 처럼 "소스일 수도, 데이터일 수도" 있는 확장자에 대해
+        # 적용할 더 엄격한 상한. 설정/매니페스트는 작아서 이 한도에 항상 통과한다.
+        self._data_file_max_bytes = data_file_max_bytes
 
     def collect(
         self,
@@ -116,7 +209,12 @@ class FileDumpCollector:
             abs_path = root / rel_path
             if not abs_path.is_file():
                 continue
-            if _should_skip(rel_path, abs_path, self._file_max_bytes):
+            if _should_skip(
+                rel_path,
+                abs_path,
+                self._file_max_bytes,
+                self._data_file_max_bytes,
+            ):
                 excluded.append(rel_path)
                 continue
             try:
@@ -147,6 +245,19 @@ class FileDumpCollector:
         # (2) 전체 예산을 꽉 채웠다면(>=)  → 프롬프트 뒤쪽이 잘렸을 가능성 높음
         # use case 레이어에서 (1)에 해당하는 경우에만 리뷰 대신 "예산 초과" 코멘트를 게시.
         exceeded = any(p for p in excluded if p in changed_set) or total_chars >= max_chars
+
+        # 관측성: 필터 효과를 매 리뷰마다 한 줄로 남긴다. 토큰 예산 튜닝/Tier 2 필터
+        # 추가 판단에 근거 자료로 쓴다.
+        logger.info(
+            "file dump: included=%d excluded=%d chars=%d/%d (%.1f%%) exceeded=%s",
+            len(entries),
+            len(excluded),
+            total_chars,
+            max_chars,
+            100.0 * total_chars / max_chars if max_chars else 0.0,
+            exceeded,
+        )
+
         return FileDump(
             entries=tuple(entries),
             total_chars=total_chars,
@@ -178,9 +289,17 @@ def _sort_by_priority(paths: list[str], changed: set[str]) -> list[str]:
     return sorted(paths, key=rank)
 
 
-def _should_skip(rel_path: str, abs_path: Path, file_max_bytes: int) -> bool:
+def _should_skip(
+    rel_path: str,
+    abs_path: Path,
+    file_max_bytes: int,
+    data_file_max_bytes: int,
+) -> bool:
     parts = rel_path.split("/")
     if any(p in _ALWAYS_SKIP_DIRS for p in parts):
+        return True
+    # Xcode asset catalog 은 번들 디렉터리명이 `.xcassets` 로 끝난다. 하위 전체 제외.
+    if any(p.endswith(".xcassets") for p in parts):
         return True
     name = parts[-1]
     if name in _LOCK_FILENAMES:
@@ -194,6 +313,11 @@ def _should_skip(rel_path: str, abs_path: Path, file_max_bytes: int) -> bool:
         size = abs_path.stat().st_size
     except OSError:
         return True
+    # 스마트 필터: 모호한 데이터형 확장자는 더 낮은 상한을 적용한다.
+    # 설정/매니페스트 이름이면 크기 제한을 건너뛰어 항상 포함되도록 허용.
+    if suffix in _AMBIGUOUS_DATA_SUFFIXES and name not in _IMPORTANT_CONFIG_NAMES:
+        if size > data_file_max_bytes:
+            return True
     if size > file_max_bytes:
         return True
     return False
@@ -201,4 +325,7 @@ def _should_skip(rel_path: str, abs_path: Path, file_max_bytes: int) -> bool:
 
 def _is_double_suffix_skip(name: str) -> bool:
     lowered = name.lower()
-    return any(lowered.endswith(s) for s in (".min.js", ".min.css", ".d.ts.map"))
+    return any(
+        lowered.endswith(s)
+        for s in (".min.js", ".min.css", ".d.ts.map", ".min.json")
+    )
