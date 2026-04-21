@@ -6,9 +6,10 @@
 """
 
 import json
+import os
 import time
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 
 import jwt
@@ -32,17 +33,34 @@ class _FakeResp:
 
 
 @pytest.fixture()
-def tz_sandbox(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """`TZ` env 를 테스트가 임의로 바꿔도 통과/실패와 무관하게 `time.tzset()` 을
-    이용해 원래 상태로 복구한다.
+def tz_sandbox() -> Iterator[Callable[[str], None]]:
+    """타임존 안전 조작 픽스처.
 
-    `monkeypatch.setenv` 만으로는 C 라이브러리 레벨의 타임존 상태를 되돌리지 못해
-    한 테스트가 실패하면 이후 테스트가 오염될 수 있다 (Gemini 지적).
+    왜 `monkeypatch.setenv` 를 쓰지 않는가:
+      monkeypatch 의 env 복원 finalizer 와 `time.tzset()` 호출 순서가 엇갈린다.
+      monkeypatch 가 먼저 설정되고 나중에 복원되므로, 같은 테스트에 쓰인 다른 fixture
+      의 teardown 이 `monkeypatch` 복원 **전에** 실행된다. 그 안에서 `tzset()` 을 불러도
+      아직 env 는 테스트가 설정한 값이라 C 런타임은 여전히 마지막 TZ 를 유지한다.
+      이후 monkeypatch 가 env 만 원복하고 `tzset()` 은 재호출되지 않아 테스트 간 오염.
+
+    해결:
+      fixture 가 직접 `TZ` env 를 보관/복원하고 teardown 에서 env 복원 **직후** `tzset()`
+      을 호출. 복원 순서가 원자적이다.
     """
-    yield
-    # teardown — assert 가 중간에 실패해도 여기까지 오는 `finally` 의미.
-    # monkeypatch 가 TZ env 를 원복시키고 나면 tzset() 을 불러 C 계층 상태까지 맞춘다.
-    time.tzset()
+    original_tz = os.environ.get("TZ")
+
+    def set_tz(name: str) -> None:
+        os.environ["TZ"] = name
+        time.tzset()
+
+    try:
+        yield set_tz
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
 
 
 def _make_client(monkeypatch: pytest.MonkeyPatch, expires_at_iso: str) -> GitHubAppClient:
@@ -57,33 +75,22 @@ def _make_client(monkeypatch: pytest.MonkeyPatch, expires_at_iso: str) -> GitHub
 
 
 def _cached_expires_at(client: GitHubAppClient, installation_id: int) -> float:
-    # 테스트 전용: 캐시 엔트리 확인. 공개 속성이 없어 내부 필드를 참조한다.
     return client._token_cache[installation_id].expires_at  # type: ignore[attr-defined]
 
 
 def test_expires_at_parsed_as_utc_regardless_of_local_tz(
-    monkeypatch: pytest.MonkeyPatch, tz_sandbox: None
+    monkeypatch: pytest.MonkeyPatch, tz_sandbox: Callable[[str], None]
 ) -> None:
-    """로컬 TZ 를 어떤 값으로 바꿔도 동일한 UTC 문자열은 동일한 epoch 로 변환돼야 한다.
-
-    `tz_sandbox` 픽스처가 assert 실패 여부와 무관하게 TZ 상태를 복구한다.
-    """
+    """로컬 TZ 를 어떤 값으로 바꿔도 동일한 UTC 문자열은 동일한 epoch 로 변환돼야 한다."""
     iso = "2026-04-22T00:00:00Z"
     expected_epoch = datetime(2026, 4, 22, 0, 0, 0, tzinfo=timezone.utc).timestamp()
 
-    for tz, label in (
-        ("UTC", "got_utc"),
-        ("Asia/Seoul", "got_kst"),
-        ("America/Los_Angeles", "got_pacific"),
-    ):
-        monkeypatch.setenv("TZ", tz)
-        time.tzset()
+    for tz in ("UTC", "Asia/Seoul", "America/Los_Angeles"):
+        tz_sandbox(tz)
         client = _make_client(monkeypatch, iso)
         client.get_installation_token(installation_id=7)
         got = _cached_expires_at(client, 7)
-        assert got == pytest.approx(expected_epoch, abs=1.0), (
-            f"TZ={tz} ({label}) 에서 epoch 불일치"
-        )
+        assert got == pytest.approx(expected_epoch, abs=1.0), f"TZ={tz} 에서 epoch 불일치"
 
 
 def test_invalid_expires_at_falls_back_to_55min_default(monkeypatch: pytest.MonkeyPatch) -> None:
