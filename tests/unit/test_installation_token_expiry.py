@@ -6,11 +6,10 @@
 """
 
 import json
-import os
 import time
 import urllib.request
+from collections.abc import Iterator
 from datetime import datetime, timezone
-from typing import Any
 
 import jwt
 import pytest
@@ -32,6 +31,20 @@ class _FakeResp:
         return self._body
 
 
+@pytest.fixture()
+def tz_sandbox(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """`TZ` env 를 테스트가 임의로 바꿔도 통과/실패와 무관하게 `time.tzset()` 을
+    이용해 원래 상태로 복구한다.
+
+    `monkeypatch.setenv` 만으로는 C 라이브러리 레벨의 타임존 상태를 되돌리지 못해
+    한 테스트가 실패하면 이후 테스트가 오염될 수 있다 (Gemini 지적).
+    """
+    yield
+    # teardown — assert 가 중간에 실패해도 여기까지 오는 `finally` 의미.
+    # monkeypatch 가 TZ env 를 원복시키고 나면 tzset() 을 불러 C 계층 상태까지 맞춘다.
+    time.tzset()
+
+
 def _make_client(monkeypatch: pytest.MonkeyPatch, expires_at_iso: str) -> GitHubAppClient:
     response_body = json.dumps({"token": "TK", "expires_at": expires_at_iso}).encode("utf-8")
 
@@ -48,41 +61,29 @@ def _cached_expires_at(client: GitHubAppClient, installation_id: int) -> float:
     return client._token_cache[installation_id].expires_at  # type: ignore[attr-defined]
 
 
-def test_expires_at_parsed_as_utc_regardless_of_local_tz(monkeypatch: pytest.MonkeyPatch) -> None:
-    """로컬 TZ 를 어떤 값으로 바꿔도 동일한 UTC 문자열은 동일한 epoch 로 변환돼야 한다."""
+def test_expires_at_parsed_as_utc_regardless_of_local_tz(
+    monkeypatch: pytest.MonkeyPatch, tz_sandbox: None
+) -> None:
+    """로컬 TZ 를 어떤 값으로 바꿔도 동일한 UTC 문자열은 동일한 epoch 로 변환돼야 한다.
+
+    `tz_sandbox` 픽스처가 assert 실패 여부와 무관하게 TZ 상태를 복구한다.
+    """
     iso = "2026-04-22T00:00:00Z"
     expected_epoch = datetime(2026, 4, 22, 0, 0, 0, tzinfo=timezone.utc).timestamp()
 
-    # (1) 로컬 TZ = UTC
-    monkeypatch.setenv("TZ", "UTC")
-    time.tzset()
-    client = _make_client(monkeypatch, iso)
-    client.get_installation_token(installation_id=7)
-    got_utc = _cached_expires_at(client, 7)
-
-    # (2) 로컬 TZ = KST (UTC+9)
-    monkeypatch.setenv("TZ", "Asia/Seoul")
-    time.tzset()
-    client = _make_client(monkeypatch, iso)
-    client.get_installation_token(installation_id=7)
-    got_kst = _cached_expires_at(client, 7)
-
-    # (3) 로컬 TZ = US/Pacific (UTC-8/-7)
-    monkeypatch.setenv("TZ", "America/Los_Angeles")
-    time.tzset()
-    client = _make_client(monkeypatch, iso)
-    client.get_installation_token(installation_id=7)
-    got_pacific = _cached_expires_at(client, 7)
-
-    # 세 결과 모두 동일 UTC epoch 로 수렴해야 한다.
-    assert got_utc == pytest.approx(expected_epoch, abs=1.0)
-    assert got_kst == pytest.approx(expected_epoch, abs=1.0)
-    assert got_pacific == pytest.approx(expected_epoch, abs=1.0)
-
-    # cleanup: 원래 TZ 로 복구 (fixture 범위)
-    if "TZ" in os.environ:
-        del os.environ["TZ"]
-    time.tzset()
+    for tz, label in (
+        ("UTC", "got_utc"),
+        ("Asia/Seoul", "got_kst"),
+        ("America/Los_Angeles", "got_pacific"),
+    ):
+        monkeypatch.setenv("TZ", tz)
+        time.tzset()
+        client = _make_client(monkeypatch, iso)
+        client.get_installation_token(installation_id=7)
+        got = _cached_expires_at(client, 7)
+        assert got == pytest.approx(expected_epoch, abs=1.0), (
+            f"TZ={tz} ({label}) 에서 epoch 불일치"
+        )
 
 
 def test_invalid_expires_at_falls_back_to_55min_default(monkeypatch: pytest.MonkeyPatch) -> None:
