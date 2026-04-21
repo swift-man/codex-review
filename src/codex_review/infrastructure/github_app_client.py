@@ -102,8 +102,20 @@ class GitHubAppClient:
             for f in files:
                 path = str(f["filename"])
                 changed.append(path)
-                # patch 는 큰 바이너리/renamed/deleted 변경에서 빠질 수 있음 → 그땐 빈 집합.
-                diff_right_lines[path] = parse_right_lines(f.get("patch"))
+                # GitHub 는 큰 diff / rename / delete / binary 상태에서 `patch` 키를 생략한다.
+                # 그 파일에 대한 인라인 코멘트는 use-case 필터에서 전부 사라지므로 조용히
+                # 넘기지 말고 운영자가 알아볼 수 있도록 경고 로그로 남긴다.
+                patch = f.get("patch")
+                if patch is None:
+                    logger.warning(
+                        "GitHub omitted patch for %s#%d file %r (status=%s); "
+                        "inline comments on this file will be suppressed",
+                        repo.full_name,
+                        number,
+                        path,
+                        f.get("status"),
+                    )
+                diff_right_lines[path] = parse_right_lines(patch)
             # 100개 미만이면 마지막 페이지 — Link 헤더 대신 길이로 단순 판정.
             if len(files) < 100:
                 break

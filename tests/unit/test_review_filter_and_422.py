@@ -208,10 +208,9 @@ def client_with_stubbed_urlopen(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
     client = GitHubAppClient(app_id=1, private_key_pem="-")
-    # installation token 캐시에 직접 넣어 `/access_tokens` 라운드트립을 스킵
-    client._token_cache[7] = type(  # type: ignore[attr-defined]
-        "Tok", (), {"token": "ITOK", "is_valid": lambda self: True}
-    )()
+    # `_token_cache` 내부 구조에 결합된 가짜 객체 주입 대신 public 메서드 자체를
+    # 교체해 테스트 주도권은 유지하되 구현 세부에 묶이지 않게 한다.
+    monkeypatch.setattr(client, "get_installation_token", lambda _iid: "ITOK")
     return client, calls, responses
 
 

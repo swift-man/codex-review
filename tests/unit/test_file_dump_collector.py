@@ -232,3 +232,30 @@ def test_whitelist_covers_swift_and_python_manifests(repo: Path) -> None:
     # 둘 다 화이트리스트라 포함돼야 함. (pyproject.toml 은 .toml 이라 data 확장자도 아님)
     assert "Package.swift" in paths
     assert "pyproject.toml" in paths
+
+
+def test_generic_json_between_data_and_file_limits_is_excluded(repo: Path) -> None:
+    """회귀 방지(PR #7 review):
+    두 제한의 책임을 분리 검증. 비화이트리스트 JSON 이
+    `data_file_max_bytes` 는 통과하지만 `file_max_bytes` 초과일 때 제외돼야 한다.
+    """
+    # 5KB 크기 — data(1KB) 초과·file(10KB) 이하 인 시나리오를 먼저 보고 포함 확인,
+    # 그 다음 file 상한을 낮춰 file 에 걸려 제외되는 시나리오를 보인다.
+    payload = '{"k": "v"}' + " " * 5_000
+    (repo / "data.json").write_text(payload, encoding="utf-8")
+    _commit_all(repo)
+
+    # (1) data_file_max_bytes 만 엄격 → 걸려서 제외
+    collector = FileDumpCollector(file_max_bytes=1_000_000, data_file_max_bytes=1_000)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(1_000_000))
+    assert "data.json" not in [e.path for e in dump.entries]
+
+    # (2) data_file_max_bytes 는 후하지만 file_max_bytes 로 걸림
+    collector = FileDumpCollector(file_max_bytes=3_000, data_file_max_bytes=1_000_000)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(1_000_000))
+    assert "data.json" not in [e.path for e in dump.entries]
+
+    # (3) 둘 다 넉넉하면 포함 — 나머지 경로가 맞는지 확인
+    collector = FileDumpCollector(file_max_bytes=1_000_000, data_file_max_bytes=1_000_000)
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(1_000_000))
+    assert "data.json" in [e.path for e in dump.entries]

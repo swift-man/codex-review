@@ -32,10 +32,18 @@ class PullRequest:
     installation_id: int
     is_draft: bool
     # path → 해당 파일에서 인라인 코멘트를 달 수 있는 RIGHT-side 라인 번호 집합.
-    # unified diff 의 context( ) 와 add(+) 라인이 포함되며, 모델이 이 범위 밖에 코멘트를
-    # 제안하면 GitHub 가 422 로 거부하므로 `post_review` 직전에 필터링 기준으로 쓴다.
-    # 타입을 `Mapping` 으로 한정해 도메인 계층에서 우연한 변경을 차단한다 —
-    # 어댑터 쪽에서 `dict` 를 만들어 넘겨도 읽기 전용 계약으로 취급된다.
+    # 타입은 `Mapping` 이지만 어댑터가 가변 dict 를 그대로 넘길 수 있으므로
+    # `__post_init__` 에서 `MappingProxyType` 으로 감싸 런타임 불변성까지 보장한다.
     diff_right_lines: Mapping[str, frozenset[int]] = field(
         default_factory=lambda: _EMPTY_DIFF_RIGHT_LINES
     )
+
+    def __post_init__(self) -> None:
+        # frozen=True 이므로 object.__setattr__ 우회가 필요. 이미 MappingProxyType 이면
+        # 재래핑하지 않아 불필요한 복사를 피한다.
+        if not isinstance(self.diff_right_lines, MappingProxyType):
+            object.__setattr__(
+                self,
+                "diff_right_lines",
+                MappingProxyType(dict(self.diff_right_lines)),
+            )

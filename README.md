@@ -94,7 +94,7 @@ REPO_FULL_NAME=owner/repo PR_NUMBER=1 INSTALLATION_ID=1234567 \
 | `CODEX_TIMEOUT_SEC` | `600` | 호출 타임아웃 |
 | `REPO_CACHE_DIR` | `~/.codex-review/repos` | clone 캐시 위치 |
 | `FILE_MAX_BYTES` | `204800` | 단일 파일 크기 상한 |
-| `DATA_FILE_MAX_BYTES` | `20000` | JSON/YAML/XML 등 모호한 확장자의 별도 상한. `package.json`·`tsconfig.json`·`pyproject.toml` 같은 화이트리스트 매니페스트는 두 한도 모두 면제. |
+| `DATA_FILE_MAX_BYTES` | `20000` | JSON/YAML/XML 등 모호한 확장자의 별도 상한. `package.json`·`tsconfig.json`·`pyproject.toml` 같은 화이트리스트 매니페스트는 두 파일 크기 제한 모두 면제. 단 전체 컨텍스트 예산(`CODEX_MAX_INPUT_TOKENS`) 초과 시에는 우선순위에 따라 제외될 수 있음. |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | 바인딩 주소 |
 | `DRY_RUN` | `0` | `1`이면 로그만 남기고 게시 안 함 |
 
