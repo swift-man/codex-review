@@ -1,5 +1,6 @@
 import logging
 import subprocess
+from dataclasses import replace
 
 from codex_review.domain import FileDump, PullRequest, ReviewResult
 
@@ -102,4 +103,6 @@ class CodexCliEngine:
                 f"codex exec failed ({result.returncode}): {result.stderr.strip()[:1000]}"
             )
 
-        return parse_review(result.stdout)
+        # 파서는 모델이 뭔지 모르므로 엔진에서 자기 식별자를 덧붙인다. PR 화면에서
+        # "어느 모델이 찍었는지" 확인이 필요할 때 본문 footer 로 바로 보인다.
+        return replace(parse_review(result.stdout), model=self._model)
