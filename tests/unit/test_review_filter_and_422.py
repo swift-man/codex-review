@@ -238,6 +238,39 @@ def test_post_review_retries_without_comments_on_422(client_with_stubbed_urlopen
     assert calls[1]["body"]["comments"] == []
 
 
+def test_post_review_422_retry_also_rerenders_body_without_findings_notice(
+    client_with_stubbed_urlopen,
+) -> None:
+    """회귀 방지: 재시도 본문이 findings 제거 상태로 다시 렌더링돼야 한다.
+    그러지 않으면 '기술 단위 코멘트 N건' 안내가 남아 실제로는 인라인이 없는데도
+    있는 것처럼 보이는 거짓 상태가 된다.
+    """
+    client, calls, responses = client_with_stubbed_urlopen
+    responses.extend([_make_http_error(422), _FakeResponse(b"{}")])
+
+    result = ReviewResult(
+        summary="전체 요약",
+        event=ReviewEvent.COMMENT,
+        positives=("좋은 점 1",),
+        improvements=("개선할 점 1",),
+        findings=(Finding(path="a.py", line=10, body="x"),),
+    )
+    pr = _pr(diff_right_lines={"a.py": frozenset({10})})
+    client.post_review(pr, result)
+
+    first_body = calls[0]["body"]["body"]
+    retry_body = calls[1]["body"]["body"]
+
+    # 1차 시도 본문엔 "기술 단위 코멘트 N건..." 안내가 있어야 한다.
+    assert "기술 단위 코멘트" in first_body
+    # 재시도 본문엔 안내가 **없어야** 한다(인라인이 실제로 빠졌으므로).
+    assert "기술 단위 코멘트" not in retry_body
+    # 다른 섹션(요약/좋은 점/개선할 점)은 재시도에도 그대로 남는다.
+    assert "전체 요약" in retry_body
+    assert "좋은 점 1" in retry_body
+    assert "개선할 점 1" in retry_body
+
+
 def test_post_review_reraises_non_422_http_errors(client_with_stubbed_urlopen) -> None:
     client, _calls, responses = client_with_stubbed_urlopen
     responses.append(_make_http_error(500))

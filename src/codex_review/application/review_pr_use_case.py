@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 
 from codex_review.domain import FileDump, Finding, PullRequest, ReviewResult, TokenBudget
@@ -67,7 +68,7 @@ def _changed_missing(pr: PullRequest, dump: FileDump) -> bool:
 
 def _filter_findings_to_diff(
     result: ReviewResult,
-    diff_right_lines: dict[str, frozenset[int]],
+    diff_right_lines: Mapping[str, frozenset[int]],
     repo_full_name: str,
     pr_number: int,
 ) -> ReviewResult:

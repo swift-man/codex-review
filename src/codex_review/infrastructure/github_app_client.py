@@ -4,7 +4,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import certifi
 import jwt
@@ -149,12 +149,18 @@ class GitHubAppClient:
             # 방어선: use-case 단계의 diff 필터가 있음에도 422 가 나면(예: diff cache 간 race,
             # GitHub 내부 정책 변화 등) 인라인 코멘트를 포기하고 본문만 재게시한다.
             # 리뷰 전체를 포기하는 것보다 낫다.
+            #
+            # 본문도 findings 제거된 상태를 기준으로 재렌더링해야 한다 — 그러지 않으면
+            # "기술 단위 코멘트 N건은 각 라인에 별도 표시됩니다" 같은 안내가 남아
+            # 실제로는 인라인이 없는데도 있는 것처럼 보이는 거짓 상태가 된다.
             if exc.code == 422 and payload["comments"]:
                 logger.warning(
                     "422 on review POST for %s#%d; retrying without inline comments",
                     pr.repo.full_name,
                     pr.number,
                 )
+                retry_result = replace(result, findings=())
+                payload["body"] = retry_result.render_body()
                 payload["comments"] = []
                 self._request("POST", url, auth=f"token {token}", body=payload)
             else:
