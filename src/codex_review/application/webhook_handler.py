@@ -78,11 +78,9 @@ class WebhookHandler:
             await self._queue.put(None)
 
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*self._workers, return_exceptions=True),
-                timeout=self._shutdown_timeout,
-            )
-        except asyncio.TimeoutError:
+            async with asyncio.timeout(self._shutdown_timeout):
+                await asyncio.gather(*self._workers, return_exceptions=True)
+        except TimeoutError:
             logger.warning(
                 "graceful shutdown exceeded %.0fs; cancelling workers",
                 self._shutdown_timeout,

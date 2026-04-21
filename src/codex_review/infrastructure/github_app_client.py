@@ -2,7 +2,7 @@ import asyncio
 import logging
 import ssl
 import time
-from collections import defaultdict
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -33,6 +33,40 @@ def _with_model_footer(body: str, model_label: str | None) -> str:
     if not model_label:
         return body
     return body + _MODEL_FOOTER_TEMPLATE.format(label=model_label)
+
+
+# installation_id 별 락을 무한히 쌓지 않도록 상한. 1024 는 현실적 규모(보통 수~수백 개
+# installation)의 10~100배 여유. 넘치면 LRU 로 가장 오래 쓰이지 않은 락을 폐기한다.
+_MAX_TRACKED_INSTALLATIONS = 1024
+
+
+class _LockRegistry:
+    """installation_id → `asyncio.Lock` 매핑을 LRU 상한으로 관리.
+
+    Gemini 의 "장기 실행 시 defaultdict 에 락이 무한히 쌓여 메모리 누수 가능" 지적에 대응.
+    상한을 넘으면 가장 오래 사용되지 않은 항목을 제거한다. 제거 시점에 해당 락을 잡고 있는
+    `async with` 블록이 있다면 그 블록은 자기 지역 변수로 락을 유지하므로 안전하게 완료되고,
+    새로 들어오는 같은 iid 요청은 새 락을 쓰게 되지만 본 애플리케이션의 동시성(최대 N=수 개)
+    규모에서는 경쟁이 사실상 일어나지 않는다.
+    """
+
+    def __init__(self, maxsize: int = _MAX_TRACKED_INSTALLATIONS) -> None:
+        self._maxsize = maxsize
+        self._locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
+
+    def get(self, installation_id: int) -> asyncio.Lock:
+        lock = self._locks.get(installation_id)
+        if lock is not None:
+            self._locks.move_to_end(installation_id)
+            return lock
+        while len(self._locks) >= self._maxsize:
+            self._locks.popitem(last=False)  # evict oldest
+        lock = asyncio.Lock()
+        self._locks[installation_id] = lock
+        return lock
+
+    def __len__(self) -> int:  # for tests / observability
+        return len(self._locks)
 
 
 @dataclass(frozen=True)
@@ -67,8 +101,8 @@ class GitHubAppClient:
         self._review_model_label = review_model_label
         self._token_cache: dict[int, _CachedToken] = {}
         # installation_id 별 개별 락. 단일 전역 락은 서로 다른 installation 의 동시 재발급까지
-        # 직렬화해 병목을 만든다. defaultdict 로 id 별 독립 락을 lazy 하게 생성한다.
-        self._token_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # 직렬화해 병목을 만든다. LRU 상한이 있는 레지스트리를 써 무한히 쌓이지 않게 한다.
+        self._token_locks = _LockRegistry()
 
     # --- Auth ---------------------------------------------------------------
 
@@ -84,7 +118,7 @@ class GitHubAppClient:
         if cached and cached.is_valid():
             return cached.token
 
-        async with self._token_locks[installation_id]:
+        async with self._token_locks.get(installation_id):
             # lock 진입 후 재확인: 대기 중 같은 installation 의 다른 워커가 이미 갱신했을 수 있다.
             cached = self._token_cache.get(installation_id)
             if cached and cached.is_valid():
@@ -117,15 +151,22 @@ class GitHubAppClient:
         pr_path = f"/repos/{repo.full_name}/pulls/{number}"
 
         # PR 메타와 첫 페이지 files 는 상호 독립적이라 병렬로 조회해 네트워크 대기 단축.
-        # (페이지 2부터는 이전 페이지 크기를 봐야 하므로 순차 유지.)
-        pr_data, first_page = await asyncio.gather(
-            self._request("GET", pr_path, auth=f"token {token}"),
-            self._request(
-                "GET",
-                f"{pr_path}/files?per_page=100&page=1",
-                auth=f"token {token}",
-            ),
-        )
+        # TaskGroup 은 형제 태스크 중 하나가 실패하면 나머지를 자동 취소해 주므로
+        # gather + return_exceptions 보다 에러 처리가 깔끔하다. (페이지 2부터는 이전 페이지
+        # 크기를 봐야 하므로 순차 유지.)
+        async with asyncio.TaskGroup() as tg:
+            meta_task = tg.create_task(
+                self._request("GET", pr_path, auth=f"token {token}")
+            )
+            first_files_task = tg.create_task(
+                self._request(
+                    "GET",
+                    f"{pr_path}/files?per_page=100&page=1",
+                    auth=f"token {token}",
+                )
+            )
+        pr_data = meta_task.result()
+        first_page = first_files_task.result()
         assert isinstance(pr_data, dict)
 
         # 변경 파일 전체를 가져와야 우선순위 정렬(변경 파일 먼저)이 정확해진다.

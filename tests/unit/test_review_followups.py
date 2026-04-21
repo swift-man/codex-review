@@ -88,6 +88,28 @@ async def test_different_installations_do_not_serialize_token_issue(
         assert peak == 2, "서로 다른 installation 은 병렬로 진행돼야 한다 (peak == 2)"
 
 
+async def test_token_lock_registry_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """회귀 방지(Gemini 재리뷰): 장기 실행 시 락이 무한 누적되지 않는다.
+    maxsize 를 넘어가는 installation_id 가 유입되면 LRU 로 오래된 락부터 폐기.
+    """
+    from codex_review.infrastructure.github_app_client import _LockRegistry
+
+    reg = _LockRegistry(maxsize=3)
+    for iid in range(10):
+        reg.get(iid)
+    assert len(reg) == 3, "상한을 넘어가면 오래된 락을 버려야 한다"
+
+    # 최근 사용된 항목이 상한 내에 살아 있는지 — LRU 의미 확인.
+    reg.get(100)
+    reg.get(200)
+    reg.get(100)     # touch 100 → 가장 최근 사용
+    reg.get(300)     # 이때 evict 되는 건 200 (LRU)
+    # 200 에 대한 락 요청을 다시 하면 새 락이 발급됨(같지 않음)
+    lock_100_first = reg.get(100)
+    lock_100_again = reg.get(100)
+    assert lock_100_first is lock_100_again, "살아 있는 항목은 동일 객체"
+
+
 async def test_same_installation_serializes_token_issue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

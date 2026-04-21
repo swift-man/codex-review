@@ -47,8 +47,9 @@ class CodexCliEngine:
             ) from exc
 
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-        except asyncio.TimeoutError as exc:
+            async with asyncio.timeout(10.0):
+                stdout, stderr = await proc.communicate()
+        except TimeoutError as exc:
             proc.kill()
             await proc.wait()
             raise CodexAuthError("codex login status 가 10초 내에 응답하지 않았습니다.") from exc
@@ -87,11 +88,9 @@ class CodexCliEngine:
         )
 
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode("utf-8")),
-                timeout=self._timeout_sec,
-            )
-        except asyncio.TimeoutError as exc:
+            async with asyncio.timeout(self._timeout_sec):
+                stdout, stderr = await proc.communicate(input=prompt.encode("utf-8"))
+        except TimeoutError as exc:
             proc.kill()
             await proc.wait()
             raise RuntimeError(

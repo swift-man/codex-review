@@ -70,18 +70,13 @@ async def test_verify_auth_raises_when_binary_missing(monkeypatch: pytest.Monkey
 
 
 async def test_verify_auth_raises_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_subprocess(monkeypatch, _FakeProc(0))
+    class _TimingOutProc(_FakeProc):
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            # `asyncio.timeout` 컨텍스트 매니저 안에서 `communicate` 가 느려 TimeoutError 가
+            # 발생하는 상황을 직접 재현 — 예외 자체를 던져 같은 경로를 타게 한다.
+            raise TimeoutError()
 
-    async def fake_wait_for(coro: Any, timeout: float) -> Any:
-        # 중요: coro 를 await 해서 async generator 를 확실히 닫아야 "coroutine was never
-        # awaited" 경고가 뜨지 않는다. 그 뒤 TimeoutError 로 실제 경로 재현.
-        coro.close()
-        raise asyncio.TimeoutError()
-
-    monkeypatch.setattr(
-        "codex_review.infrastructure.codex_cli_engine.asyncio.wait_for",
-        fake_wait_for,
-    )
+    _patch_subprocess(monkeypatch, _TimingOutProc(0))
 
     with pytest.raises(CodexAuthError) as exc:
         await _engine().verify_auth()
