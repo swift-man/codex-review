@@ -295,32 +295,74 @@ def _should_skip(
     file_max_bytes: int,
     data_file_max_bytes: int,
 ) -> bool:
+    """Decide whether to exclude a tracked file from the dump.
+
+    필터는 세 단계로 나뉜다 — 아이덴티티(경로/이름) → 확장자 → 크기.
+    각 단계가 실패 이유(왜 제외되는지)를 한 군데 모아 두므로 Tier 추가/삭제 시 영향 범위가
+    작아진다.
+    """
     parts = rel_path.split("/")
+    if _is_in_always_skip_dir(parts):
+        return True
+    name = parts[-1]
+    suffix = abs_path.suffix.lower()
+    if _is_hard_excluded_name_or_suffix(name, suffix):
+        return True
+    return _exceeds_size_limit(
+        abs_path, name, suffix, file_max_bytes, data_file_max_bytes
+    )
+
+
+def _is_in_always_skip_dir(parts: list[str]) -> bool:
     if any(p in _ALWAYS_SKIP_DIRS for p in parts):
         return True
     # Xcode asset catalog 은 번들 디렉터리명이 `.xcassets` 로 끝난다. 하위 전체 제외.
     if any(p.endswith(".xcassets") for p in parts):
         return True
-    name = parts[-1]
+    return False
+
+
+def _is_hard_excluded_name_or_suffix(name: str, suffix: str) -> bool:
     if name in _LOCK_FILENAMES:
         return True
-    suffix = abs_path.suffix.lower()
     if suffix in _SKIP_SUFFIXES:
         return True
     if _is_double_suffix_skip(name):
         return True
+    return False
+
+
+def _is_important_config(name: str) -> bool:
+    """Known project manifests that must reach the reviewer regardless of size.
+
+    대형 모노레포의 루트 `package.json` 처럼 수백 KB 에 이르는 매니페스트도 리뷰 컨텍스트에
+    반드시 포함돼야 한다. 이름 기반 화이트리스트라 실수로 데이터 덤프를 끌어올 위험은 낮다.
+    """
+    return name in _IMPORTANT_CONFIG_NAMES
+
+
+def _exceeds_size_limit(
+    abs_path: Path,
+    name: str,
+    suffix: str,
+    file_max_bytes: int,
+    data_file_max_bytes: int,
+) -> bool:
     try:
         size = abs_path.stat().st_size
     except OSError:
         return True
-    # 스마트 필터: 모호한 데이터형 확장자는 더 낮은 상한을 적용한다.
-    # 설정/매니페스트 이름이면 크기 제한을 건너뛰어 항상 포함되도록 허용.
-    if suffix in _AMBIGUOUS_DATA_SUFFIXES and name not in _IMPORTANT_CONFIG_NAMES:
-        if size > data_file_max_bytes:
-            return True
-    if size > file_max_bytes:
+
+    # 화이트리스트 매니페스트(package.json, tsconfig.json 등)는 두 한도 모두 면제.
+    # PR #5 리뷰에서 지적됐듯 `data_file_max_bytes` 만 우회하고 `file_max_bytes` 가 걸리면
+    # 큰 모노레포 매니페스트가 여전히 빠져 리뷰 컨텍스트 품질이 떨어진다.
+    if _is_important_config(name):
+        return False
+
+    # 모호한 데이터형 확장자(JSON/YAML/XML/...)는 더 낮은 상한을 먼저 적용한다.
+    if suffix in _AMBIGUOUS_DATA_SUFFIXES and size > data_file_max_bytes:
         return True
-    return False
+    return size > file_max_bytes
 
 
 def _is_double_suffix_skip(name: str) -> bool:

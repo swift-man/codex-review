@@ -13,7 +13,6 @@ def _git(cwd: Path, *args: str) -> None:
 
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
-    _git(tmp_path := tmp_path / "repo", "init", "-q") if False else None
     tmp_path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     _git(tmp_path, "config", "user.email", "test@example.com")
@@ -185,3 +184,51 @@ def test_package_resolved_is_skipped(repo: Path) -> None:
     collector = FileDumpCollector(file_max_bytes=1024 * 1024)
     dump = collector.collect(repo, changed_files=(), budget=TokenBudget(10_000))
     assert "Package.resolved" not in [e.path for e in dump.entries]
+
+
+def test_whitelisted_config_bypasses_file_max_bytes(repo: Path) -> None:
+    """회귀 방지(PR #5 review):
+    `_IMPORTANT_CONFIG_NAMES` 는 `data_file_max_bytes` 뿐 아니라 `file_max_bytes` 도
+    우회해야 한다. 모노레포의 루트 `package.json` 이 200KB 를 넘어도 리뷰 컨텍스트에
+    반드시 포함돼야 하기 때문이다.
+    """
+    # file_max_bytes 를 아주 낮게(1KB) 잡아도 화이트리스트는 살아남아야 한다.
+    (repo / "package.json").write_text(
+        '{"name": "big-app"}' + " " * 10_000, encoding="utf-8"
+    )  # 10KB 정도
+    # 같은 크기의 비화이트리스트 JSON 은 file_max_bytes 에 걸려 제외돼야 한다.
+    (repo / "arbitrary.json").write_text(
+        '{"k": "v"}' + " " * 10_000, encoding="utf-8"
+    )
+    _commit_all(repo)
+
+    collector = FileDumpCollector(
+        file_max_bytes=1024,  # 1KB 만 허용
+        data_file_max_bytes=500,
+    )
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(1_000_000))
+    paths = [e.path for e in dump.entries]
+
+    assert "package.json" in paths
+    assert "arbitrary.json" not in paths
+
+
+def test_whitelist_covers_swift_and_python_manifests(repo: Path) -> None:
+    (repo / "Package.swift").write_text(
+        '// swift-tools-version:5.9' + " " * 30_000, encoding="utf-8"
+    )
+    (repo / "pyproject.toml").write_text(
+        "[project]\n" + "x = 1\n" * 2000, encoding="utf-8"
+    )
+    _commit_all(repo)
+
+    # 일반 파일이면 file_max_bytes(5KB) 로 잘릴 크기.
+    collector = FileDumpCollector(
+        file_max_bytes=5_000, data_file_max_bytes=1_000
+    )
+    dump = collector.collect(repo, changed_files=(), budget=TokenBudget(1_000_000))
+    paths = [e.path for e in dump.entries]
+
+    # 둘 다 화이트리스트라 포함돼야 함. (pyproject.toml 은 .toml 이라 data 확장자도 아님)
+    assert "Package.swift" in paths
+    assert "pyproject.toml" in paths
