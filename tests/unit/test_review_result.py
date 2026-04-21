@@ -35,9 +35,6 @@ def test_render_body_without_findings_does_not_mention_inline_comments() -> None
 
 
 def test_render_body_does_not_include_model_footer() -> None:
-    """도메인 렌더는 "누가 찍었는지" 같은 운영 메타를 몰라야 한다.
-    모델 footer 는 인프라 계층(GitHubAppClient) 이 상수로 붙인다.
-    """
     result = ReviewResult(summary="요약", event=ReviewEvent.COMMENT)
     body = result.render_body()
     assert "리뷰 모델" not in body

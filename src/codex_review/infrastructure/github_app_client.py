@@ -23,8 +23,7 @@ def _default_tls_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
 
-# 리뷰 본문 맨 아래에 붙는 "어느 모델이 찍었는지" footer 의 고정 포맷.
-# 모델명은 LLM 이 결정하지 않고 서버 설정 상수(CODEX_MODEL env) 에서만 들어온다.
+# 리뷰 본문 footer 포맷. 모델명은 `CODEX_MODEL` 값을 그대로 표시한다.
 _MODEL_FOOTER_TEMPLATE = "\n\n---\n<sub>리뷰 모델: <code>{label}</code></sub>"
 
 
@@ -62,9 +61,7 @@ class GitHubAppClient:
         # DIP: 기본값은 certifi 기반 컨텍스트지만 테스트/다른 CA 번들 주입이 필요할 때
         # 생성자에서 SSLContext 를 교체할 수 있도록 열어 둔다.
         self._tls_context = tls_context or _default_tls_context()
-        # 리뷰 본문 footer 에 표시할 모델 라벨(상수). 기동 시점에 `settings.codex_model`
-        # 에서 읽어 전달받고, LLM 출력이나 리뷰 실행 결과와 무관하게 모든 POST 에 동일하게
-        # 쓰인다. None 이면 footer 자체를 붙이지 않는다.
+        # 본문 footer 에 표시할 모델 라벨. None 이면 footer 생략.
         self._review_model_label = review_model_label
         self._token_cache: dict[int, _CachedToken] = {}
 
