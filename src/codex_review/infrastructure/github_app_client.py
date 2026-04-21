@@ -4,12 +4,14 @@ import ssl
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import certifi
 import jwt
 
 from codex_review.domain import Finding, PullRequest, RepoRef, ReviewEvent, ReviewResult
+
+from .diff_parser import parse_right_lines
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +93,17 @@ class GitHubAppClient:
         # per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
         files_url = f"{pr_url}/files?per_page=100"
         changed: list[str] = []
+        diff_right_lines: dict[str, frozenset[int]] = {}
         page = 1
         while True:
             files = self._request("GET", f"{files_url}&page={page}", auth=f"token {token}")
             if not isinstance(files, list) or not files:
                 break
-            changed.extend(str(f["filename"]) for f in files)
+            for f in files:
+                path = str(f["filename"])
+                changed.append(path)
+                # patch 는 큰 바이너리/renamed/deleted 변경에서 빠질 수 있음 → 그땐 빈 집합.
+                diff_right_lines[path] = parse_right_lines(f.get("patch"))
             # 100개 미만이면 마지막 페이지 — Link 헤더 대신 길이로 단순 판정.
             if len(files) < 100:
                 break
@@ -117,6 +124,7 @@ class GitHubAppClient:
             changed_files=tuple(changed),
             installation_id=installation_id,
             is_draft=bool(pr_data.get("draft", False)),
+            diff_right_lines=diff_right_lines,
         )
 
     def post_review(self, pr: PullRequest, result: ReviewResult) -> None:
@@ -126,6 +134,7 @@ class GitHubAppClient:
 
         token = self.get_installation_token(pr.installation_id)
         url = f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}/reviews"
+
         # commit_id 를 명시해야 리뷰가 "이 head SHA 시점"에 고정된다. 생략하면 최신 SHA 기준으로
         # 붙어 라인 번호 오정렬이 발생할 수 있다.
         payload: dict[str, object] = {
@@ -134,7 +143,28 @@ class GitHubAppClient:
             "event": result.event.value,
             "comments": [_finding_to_comment(f) for f in result.findings],
         }
-        self._request("POST", url, auth=f"token {token}", body=payload)
+        try:
+            self._request("POST", url, auth=f"token {token}", body=payload)
+        except urllib.error.HTTPError as exc:
+            # 방어선: use-case 단계의 diff 필터가 있음에도 422 가 나면(예: diff cache 간 race,
+            # GitHub 내부 정책 변화 등) 인라인 코멘트를 포기하고 본문만 재게시한다.
+            # 리뷰 전체를 포기하는 것보다 낫다.
+            #
+            # 본문도 findings 제거된 상태를 기준으로 재렌더링해야 한다 — 그러지 않으면
+            # "기술 단위 코멘트 N건은 각 라인에 별도 표시됩니다" 같은 안내가 남아
+            # 실제로는 인라인이 없는데도 있는 것처럼 보이는 거짓 상태가 된다.
+            if exc.code == 422 and payload["comments"]:
+                logger.warning(
+                    "422 on review POST for %s#%d; retrying without inline comments",
+                    pr.repo.full_name,
+                    pr.number,
+                )
+                retry_result = replace(result, findings=())
+                payload["body"] = retry_result.render_body()
+                payload["comments"] = []
+                self._request("POST", url, auth=f"token {token}", body=payload)
+            else:
+                raise
 
     def post_comment(self, pr: PullRequest, body: str) -> None:
         if self._dry_run:

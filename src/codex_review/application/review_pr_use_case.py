@@ -1,6 +1,8 @@
 import logging
+from collections.abc import Mapping
+from dataclasses import replace
 
-from codex_review.domain import FileDump, PullRequest, TokenBudget
+from codex_review.domain import FileDump, Finding, PullRequest, ReviewResult, TokenBudget
 from codex_review.interfaces import FileCollector, GitHubClient, RepoFetcher, ReviewEngine
 
 logger = logging.getLogger(__name__)
@@ -50,12 +52,53 @@ class ReviewPullRequestUseCase:
             len(dump.excluded),
         )
         result = self._engine.review(pr, dump)
+
+        # 모델이 제안한 인라인 코멘트를 PR diff 의 RIGHT-side 라인 집합과 교차해 걸러낸다.
+        # (변경되지 않은 파일/줄에 코멘트를 달면 GitHub 가 422 로 리뷰 전체를 거부한다.)
+        # 걸러진 항목은 본문 렌더링에도 반영되도록 ReviewResult 자체를 새로 만든다.
+        result = _filter_findings_to_diff(result, pr.diff_right_lines, pr.repo.full_name, pr.number)
+
         self._github.post_review(pr, result)
 
 
 def _changed_missing(pr: PullRequest, dump: FileDump) -> bool:
     included = {e.path for e in dump.entries}
     return any(cf not in included for cf in pr.changed_files)
+
+
+def _filter_findings_to_diff(
+    result: ReviewResult,
+    diff_right_lines: Mapping[str, frozenset[int]],
+    repo_full_name: str,
+    pr_number: int,
+) -> ReviewResult:
+    """Drop findings whose (path, line) is not in the PR's RIGHT-side diff.
+
+    diff 정보가 비어 있으면(fetch 실패나 테스트 더블) 보수적으로 전부 드롭한다.
+    드롭 건수는 로그로 남겨 튜닝/디버깅에 활용한다.
+    """
+    if not result.findings:
+        return result
+
+    kept: list[Finding] = []
+    dropped: list[Finding] = []
+    for f in result.findings:
+        allowed = diff_right_lines.get(f.path)
+        if allowed is not None and f.line in allowed:
+            kept.append(f)
+        else:
+            dropped.append(f)
+
+    if dropped:
+        logger.info(
+            "%s#%d — dropped %d/%d inline finding(s) not on RIGHT-side diff",
+            repo_full_name,
+            pr_number,
+            len(dropped),
+            len(result.findings),
+        )
+        return replace(result, findings=tuple(kept))
+    return result
 
 
 def _budget_exceeded_message(pr: PullRequest, dump: FileDump) -> str:
