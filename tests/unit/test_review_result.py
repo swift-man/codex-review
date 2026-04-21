@@ -34,36 +34,11 @@ def test_render_body_without_findings_does_not_mention_inline_comments() -> None
     assert "기술 단위 코멘트" not in body
 
 
-def test_render_body_appends_model_footer_when_model_set() -> None:
-    result = ReviewResult(
-        summary="요약",
-        event=ReviewEvent.COMMENT,
-        model="gpt-5.4",
-    )
-    body = result.render_body()
-    # footer 는 맨 아래에 붙어야 한다.
-    assert body.rstrip().endswith("<code>gpt-5.4</code></sub>")
-    assert "리뷰 모델" in body
-
-
-def test_render_body_no_model_footer_when_model_is_none() -> None:
+def test_render_body_does_not_include_model_footer() -> None:
+    """도메인 렌더는 "누가 찍었는지" 같은 운영 메타를 몰라야 한다.
+    모델 footer 는 인프라 계층(GitHubAppClient) 이 상수로 붙인다.
+    """
     result = ReviewResult(summary="요약", event=ReviewEvent.COMMENT)
     body = result.render_body()
     assert "리뷰 모델" not in body
     assert "<sub>" not in body
-
-
-def test_render_body_model_footer_appears_after_all_sections() -> None:
-    result = ReviewResult(
-        summary="요약",
-        event=ReviewEvent.COMMENT,
-        positives=("p",),
-        improvements=("i",),
-        findings=(Finding(path="a.py", line=1, body="f"),),
-        model="gpt-5.4",
-    )
-    body = result.render_body()
-    # 각 섹션이 footer 앞에 위치해야 한다.
-    footer_idx = body.index("리뷰 모델")
-    for marker in ("**좋은 점**", "**개선할 점**", "기술 단위 코멘트"):
-        assert body.index(marker) < footer_idx

@@ -288,3 +288,88 @@ def test_post_review_does_not_retry_when_no_comments(client_with_stubbed_urlopen
     with pytest.raises(urllib.error.HTTPError):
         client.post_review(_pr(), result)
     assert len(calls) == 1  # no retry when there were no comments to drop
+
+
+# ---------------------------------------------------------------------------
+# Model footer (constant) — 인프라 계층에서만 붙는다.
+# ---------------------------------------------------------------------------
+
+
+def _capture_urlopen(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+
+    def fake_urlopen(req, *, timeout=None, context=None):
+        body = json.loads(req.data.decode("utf-8")) if req.data else None
+        calls.append({"body": body})
+        return _FakeResponse(b"{}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+    return calls
+
+
+def _client_with_token_cache(model_label: str | None = None) -> GitHubAppClient:
+    client = GitHubAppClient(
+        app_id=1, private_key_pem="-", review_model_label=model_label
+    )
+    client._token_cache[7] = type(  # type: ignore[attr-defined]
+        "Tok", (), {"token": "ITOK", "is_valid": lambda self: True}
+    )()
+    return client
+
+
+def test_post_review_appends_model_footer_from_constant_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """리뷰 본문 맨 아래에 `review_model_label` 상수가 footer 로 붙는지 확인.
+    모델명은 LLM 이 아니라 GitHubAppClient 생성자 상수에서 온다.
+    """
+    calls = _capture_urlopen(monkeypatch)
+    client = _client_with_token_cache(model_label="gpt-5.4")
+
+    client.post_review(
+        _pr(diff_right_lines={"a.py": frozenset({10})}),
+        ReviewResult(
+            summary="요약",
+            event=ReviewEvent.COMMENT,
+            findings=(Finding(path="a.py", line=10, body="x"),),
+        ),
+    )
+
+    body = calls[0]["body"]["body"]
+    assert body.rstrip().endswith("<code>gpt-5.4</code></sub>")
+    assert "리뷰 모델" in body
+
+
+def test_post_review_omits_footer_when_label_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _capture_urlopen(monkeypatch)
+    client = _client_with_token_cache(model_label=None)
+
+    client.post_review(_pr(), ReviewResult(summary="요약", event=ReviewEvent.COMMENT))
+
+    body = calls[0]["body"]["body"]
+    assert "리뷰 모델" not in body
+    assert "<sub>" not in body
+
+
+def test_post_review_422_retry_keeps_model_footer(
+    client_with_stubbed_urlopen,
+) -> None:
+    """회귀 방지: 422 재시도 본문도 동일한 모델 footer 를 달고 나가야 한다.
+    모델 라벨은 상수라 1차/재시도 모두 같은 문자열이 붙는다.
+    """
+    client, calls, responses = client_with_stubbed_urlopen
+    client._review_model_label = "gpt-5.4"  # type: ignore[attr-defined]
+    responses.extend([_make_http_error(422), _FakeResponse(b"{}")])
+
+    client.post_review(
+        _pr(diff_right_lines={"a.py": frozenset({10})}),
+        _review_result_with_inline(),
+    )
+
+    assert "리뷰 모델" in calls[0]["body"]["body"]
+    assert "리뷰 모델" in calls[1]["body"]["body"]
+    # 재시도에서는 "기술 단위 코멘트" 안내가 빠져야 한다 (findings 제거)
+    assert "기술 단위 코멘트" not in calls[1]["body"]["body"]
