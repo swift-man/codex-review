@@ -1,11 +1,18 @@
-"""Tests for severity-based inline prefix + model footer preservation."""
+"""Tests for severity-based inline prefix + model footer preservation.
+
+async 전환 이후에도 severity → 인라인 접두, `review_model_label` → footer 동작이
+그대로 유지돼야 한다. `httpx.AsyncClient(transport=MockTransport(...))` 로 주입해
+실제 POST payload 를 캡처하고 검증.
+"""
 
 import json
-import urllib.request
-from typing import Any
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 
+import httpx
 import jwt
 import pytest
+import pytest_asyncio
 
 from codex_review.domain import (
     Finding,
@@ -54,38 +61,44 @@ def _pr() -> PullRequest:
     )
 
 
-class _FakeResp:
-    def __init__(self, body: bytes) -> None:
-        self._b = body
-
-    def __enter__(self) -> "_FakeResp":
-        return self
-
-    def __exit__(self, *_a: object) -> None:
-        return None
-
-    def read(self) -> bytes:
-        return self._b
-
-
-def test_post_review_sends_severity_prefixed_comments_and_model_footer(
+@pytest_asyncio.fixture()
+async def capturing_client(
     monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[tuple[GitHubAppClient, list[httpx.Request]]]:
+    """POST payload 를 캡처하는 mock transport 가 달린 async client 팩토리."""
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+    posts: list[httpx.Request] = []
+
+    async with AsyncExitStack() as stack:
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path.endswith("/access_tokens"):
+                return httpx.Response(
+                    200, json={"token": "ITOK", "expires_at": "2026-04-22T00:00:00Z"}
+                )
+            if "/reviews" in req.url.path and req.method == "POST":
+                posts.append(req)
+            return httpx.Response(200, json={})
+
+        http_client = httpx.AsyncClient(
+            base_url="https://api.github.com",
+            transport=httpx.MockTransport(handler),
+        )
+        stack.push_async_callback(http_client.aclose)
+        client = GitHubAppClient(
+            app_id=1,
+            private_key_pem="-",
+            http_client=http_client,
+            review_model_label="gpt-5.4",
+        )
+        yield client, posts
+
+
+async def test_post_review_sends_severity_prefixed_comments_and_model_footer(
+    capturing_client: tuple[GitHubAppClient, list[httpx.Request]],
 ) -> None:
     """회귀 방지: severity 접두 + footer 가 실제 POST 페이로드에 함께 들어간다."""
-    calls: list[dict[str, Any]] = []
-
-    def fake_urlopen(req, *, timeout=None, context=None):
-        body = json.loads(req.data.decode("utf-8")) if req.data else None
-        calls.append({"body": body})
-        return _FakeResp(b"{}")
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
-
-    client = GitHubAppClient(
-        app_id=1, private_key_pem="-", review_model_label="gpt-5.4"
-    )
-    monkeypatch.setattr(client, "get_installation_token", lambda _iid: "ITOK")
+    client, posts = capturing_client
 
     result = ReviewResult(
         summary="요약",
@@ -98,9 +111,10 @@ def test_post_review_sends_severity_prefixed_comments_and_model_footer(
             ),
         ),
     )
-    client.post_review(_pr(), result)
+    await client.post_review(_pr(), result)
 
-    posted = calls[0]["body"]
+    assert len(posts) == 1
+    posted = json.loads(posts[0].content.decode("utf-8"))
 
     # (1) 본문 섹션: 반드시 수정 + footer
     assert "**🔴 반드시 수정할 사항**" in posted["body"]

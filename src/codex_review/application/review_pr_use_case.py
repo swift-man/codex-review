@@ -25,11 +25,16 @@ class ReviewPullRequestUseCase:
         self._engine = engine
         self._budget = TokenBudget(max_tokens=max_input_tokens)
 
-    def execute(self, pr: PullRequest) -> None:
-        token = self._github.get_installation_token(pr.installation_id)
-        repo_path = self._repo_fetcher.checkout(pr, token)
+    async def execute(self, pr: PullRequest) -> None:
+        token = await self._github.get_installation_token(pr.installation_id)
 
-        dump = self._file_collector.collect(repo_path, pr.changed_files, self._budget)
+        # 저장소 락 범위를 checkout ~ 파일 수집 전체로 확대한다. 이전 구현은 `checkout()`
+        # 리턴과 동시에 락이 풀려, 같은 저장소의 다른 PR 이 head SHA 를 바꾸는 동안
+        # 이 쪽 collect 가 파일을 읽어 "다른 PR 의 트리" 를 수집하는 경쟁이 있었다.
+        async with self._repo_fetcher.session(pr, token) as repo_path:
+            dump = await self._file_collector.collect(repo_path, pr.changed_files, self._budget)
+
+        # 이 지점 이후 파일 I/O 없음 — dump 는 메모리에 담긴 스냅샷. 락을 풀어도 안전.
 
         # 변경 파일이 예산 때문에 잘려 나갔다면 "전체 리뷰"가 성립하지 않는다. 저품질 리뷰를
         # 게시하느니 리뷰를 건너뛰고 운영자에게 조치 방법을 안내 코멘트로 남긴다.
@@ -40,7 +45,7 @@ class ReviewPullRequestUseCase:
                 pr.repo.full_name,
                 pr.number,
             )
-            self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
+            await self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
             return
 
         logger.info(
@@ -51,14 +56,14 @@ class ReviewPullRequestUseCase:
             dump.total_chars,
             len(dump.excluded),
         )
-        result = self._engine.review(pr, dump)
+        result = await self._engine.review(pr, dump)
 
         # 모델이 제안한 인라인 코멘트를 PR diff 의 RIGHT-side 라인 집합과 교차해 걸러낸다.
         # (변경되지 않은 파일/줄에 코멘트를 달면 GitHub 가 422 로 리뷰 전체를 거부한다.)
         # 걸러진 항목은 본문 렌더링에도 반영되도록 ReviewResult 자체를 새로 만든다.
         result = _filter_findings_to_diff(result, pr.diff_right_lines, pr.repo.full_name, pr.number)
 
-        self._github.post_review(pr, result)
+        await self._github.post_review(pr, result)
 
 
 def _changed_missing(pr: PullRequest, dump: FileDump) -> bool:

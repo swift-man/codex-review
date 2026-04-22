@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     host: str = Field(default="127.0.0.1", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
     dry_run: bool = Field(default=False, alias="DRY_RUN")
+    # 동시에 처리할 리뷰 최대 개수. 1 이면 현행 직렬 동작. 2~ 로 올리면 여러 PR 이
+    # 들어올 때 병렬 처리 — Codex 쿼터 여유와 맞춰 조절한다.
+    review_concurrency: int = Field(default=1, alias="REVIEW_CONCURRENCY")
+    # 웹훅 큐 상한. None 이면 `review_concurrency * 10` 으로 자동 계산. 가득 차면 503 반환.
+    # 무제한 큐는 Codex 장애 시 메모리와 대기시간을 무한히 누적시킬 수 있어 방어적으로 제한.
+    review_queue_maxsize: int | None = Field(default=None, alias="REVIEW_QUEUE_MAXSIZE")
 
     def load_private_key(self) -> str:
         if self.github_app_private_key:

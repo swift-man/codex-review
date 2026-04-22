@@ -4,20 +4,20 @@ from codex_review.domain import PullRequest, RepoRef, ReviewResult
 
 
 class GitHubClient(Protocol):
-    def fetch_pull_request(
+    async def fetch_pull_request(
         self, repo: RepoRef, number: int, installation_id: int
     ) -> PullRequest: ...
 
-    def post_review(
+    async def post_review(
         self,
         pr: PullRequest,
         result: ReviewResult,
     ) -> None: ...
 
-    def post_comment(
+    async def post_comment(
         self,
         pr: PullRequest,
         body: str,
     ) -> None: ...
 
-    def get_installation_token(self, installation_id: int) -> str: ...
+    async def get_installation_token(self, installation_id: int) -> str: ...

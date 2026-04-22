@@ -13,6 +13,7 @@ dependencies = [
     "pyjwt[crypto]>=2.8",
     "pydantic-settings>=2.2",
     "certifi>=2024.2.2",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]

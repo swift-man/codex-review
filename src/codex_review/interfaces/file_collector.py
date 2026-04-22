@@ -5,7 +5,7 @@ from codex_review.domain import FileDump, TokenBudget
 
 
 class FileCollector(Protocol):
-    def collect(
+    async def collect(
         self,
         root: Path,
         changed_files: tuple[str, ...],

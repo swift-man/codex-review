@@ -3,33 +3,23 @@
 이전 구현은 `time.mktime(time.strptime(..., "%Y-%m-%dT%H:%M:%SZ"))` 를 썼는데
 이 조합은 UTC 로 파싱되지 않고 로컬 타임존 기준으로 초가 계산되어 만료 시각이
 타임존 오프셋(예: KST 에서 -9시간) 만큼 어긋나는 버그가 있었다.
+
+async 전환 이후에도 동일한 계약을 보장해야 한다 — `GitHubAppClient` 는
+`httpx.AsyncClient(transport=MockTransport(...))` 로 주입받아 같은 경로를 검증.
 """
 
-import json
 import os
 import time
-import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 
+import httpx
 import jwt
 import pytest
+import pytest_asyncio
 
 from codex_review.infrastructure.github_app_client import GitHubAppClient
-
-
-class _FakeResp:
-    def __init__(self, body: bytes) -> None:
-        self._body = body
-
-    def __enter__(self) -> "_FakeResp":
-        return self
-
-    def __exit__(self, *_a: object) -> None:
-        return None
-
-    def read(self) -> bytes:
-        return self._body
 
 
 @pytest.fixture()
@@ -63,23 +53,44 @@ def tz_sandbox() -> Iterator[Callable[[str], None]]:
         time.tzset()
 
 
-def _make_client(monkeypatch: pytest.MonkeyPatch, expires_at_iso: str) -> GitHubAppClient:
-    response_body = json.dumps({"token": "TK", "expires_at": expires_at_iso}).encode("utf-8")
+@pytest_asyncio.fixture()
+async def client_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[Callable[[str], GitHubAppClient]]:
+    """`expires_at` ISO 값을 받아 GitHubAppClient 를 만드는 팩토리.
 
-    def fake_urlopen(req, *, timeout=None, context=None):
-        return _FakeResp(response_body)
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    `async with httpx.AsyncClient(...)` 수명 주기를 `AsyncExitStack` 으로 모아
+    teardown 에서 한꺼번에 `aclose()` — 동기 teardown 에서 `run_until_complete` 를
+    쓰다 루프가 꼬이는 문제를 회피.
+    """
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
-    return GitHubAppClient(app_id=1, private_key_pem="-")
+
+    async with AsyncExitStack() as stack:
+
+        def make(expires_at_iso: str) -> GitHubAppClient:
+            def handler(req: httpx.Request) -> httpx.Response:
+                # token 발급 엔드포인트만 응답 — 나머지는 테스트에서 사용하지 않는다.
+                return httpx.Response(
+                    200, json={"token": "TK", "expires_at": expires_at_iso}
+                )
+
+            http_client = httpx.AsyncClient(
+                base_url="https://api.github.com",
+                transport=httpx.MockTransport(handler),
+            )
+            stack.push_async_callback(http_client.aclose)
+            return GitHubAppClient(app_id=1, private_key_pem="-", http_client=http_client)
+
+        yield make
 
 
 def _cached_expires_at(client: GitHubAppClient, installation_id: int) -> float:
     return client._token_cache[installation_id].expires_at  # type: ignore[attr-defined]
 
 
-def test_expires_at_parsed_as_utc_regardless_of_local_tz(
-    monkeypatch: pytest.MonkeyPatch, tz_sandbox: Callable[[str], None]
+async def test_expires_at_parsed_as_utc_regardless_of_local_tz(
+    client_factory: Callable[[str], GitHubAppClient],
+    tz_sandbox: Callable[[str], None],
 ) -> None:
     """로컬 TZ 를 어떤 값으로 바꿔도 동일한 UTC 문자열은 동일한 epoch 로 변환돼야 한다."""
     iso = "2026-04-22T00:00:00Z"
@@ -87,16 +98,18 @@ def test_expires_at_parsed_as_utc_regardless_of_local_tz(
 
     for tz in ("UTC", "Asia/Seoul", "America/Los_Angeles"):
         tz_sandbox(tz)
-        client = _make_client(monkeypatch, iso)
-        client.get_installation_token(installation_id=7)
+        client = client_factory(iso)
+        await client.get_installation_token(installation_id=7)
         got = _cached_expires_at(client, 7)
         assert got == pytest.approx(expected_epoch, abs=1.0), f"TZ={tz} 에서 epoch 불일치"
 
 
-def test_invalid_expires_at_falls_back_to_55min_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = _make_client(monkeypatch, "not-a-real-timestamp")
+async def test_invalid_expires_at_falls_back_to_55min_default(
+    client_factory: Callable[[str], GitHubAppClient],
+) -> None:
+    client = client_factory("not-a-real-timestamp")
     before = time.time()
-    client.get_installation_token(installation_id=7)
+    await client.get_installation_token(installation_id=7)
     got = _cached_expires_at(client, 7)
 
     # 5분 여유가 걸린 55분 뒤 기본값이 쓰여야 한다.
@@ -104,10 +117,12 @@ def test_invalid_expires_at_falls_back_to_55min_default(monkeypatch: pytest.Monk
     assert abs(got - expected) < 5.0
 
 
-def test_empty_expires_at_falls_back_to_55min_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = _make_client(monkeypatch, "")
+async def test_empty_expires_at_falls_back_to_55min_default(
+    client_factory: Callable[[str], GitHubAppClient],
+) -> None:
+    client = client_factory("")
     before = time.time()
-    client.get_installation_token(installation_id=7)
+    await client.get_installation_token(installation_id=7)
     got = _cached_expires_at(client, 7)
 
     expected = before + 55 * 60

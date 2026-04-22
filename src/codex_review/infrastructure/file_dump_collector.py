@@ -1,5 +1,5 @@
+import asyncio
 import logging
-import subprocess
 from pathlib import Path
 
 from codex_review.domain import FileDump, FileEntry, TokenBudget
@@ -185,96 +185,130 @@ class FileDumpCollector:
         # 적용할 더 엄격한 상한. 설정/매니페스트는 작아서 이 한도에 항상 통과한다.
         self._data_file_max_bytes = data_file_max_bytes
 
-    def collect(
+    async def collect(
         self,
         root: Path,
         changed_files: tuple[str, ...],
         budget: TokenBudget,
     ) -> FileDump:
-        # git ls-files 로 .gitignore 를 존중하는 "진짜 소스" 파일만 뽑는다.
-        # 레포 루트 파일을 os.walk 로 순회하면 로컬 빌드 산출물까지 섞여 들어온다.
-        tracked = _git_ls_files(root)
+        # git ls-files 는 async subprocess 로 먼저 실행 — 진짜 소스 파일만 뽑아낸다.
+        tracked = await _git_ls_files(root)
         changed_set = set(changed_files)
-
-        # 변경 파일 → 핵심 소스 디렉터리 → 기타 순으로 정렬하는 이유:
-        # 예산이 부족할 때 하위 우선순위 파일부터 잘라내야 PR 컨텍스트가 살아남는다.
+        # 예산이 부족할 때 하위 우선순위 파일부터 잘려 나가야 PR 컨텍스트가 살아남는다.
         ordered = _sort_by_priority(tracked, changed_set)
 
-        entries: list[FileEntry] = []
-        excluded: list[str] = []
-        total_chars = 0
-        max_chars = budget.max_chars()
+        # 파일 stat/read 는 블로킹 I/O 라 이벤트 루프에서 직접 돌리면 동일 루프의 다른 웹훅·
+        # 리뷰 처리까지 지연된다. 큰 저장소(수백 파일)에선 수백 ms 이상. 순수 계산·블로킹 I/O
+        # 구간을 별도 스레드로 오프로드해 이벤트 루프를 열어 둔다.
+        return await asyncio.to_thread(
+            _build_dump_sync,
+            root,
+            ordered,
+            changed_set,
+            budget,
+            self._file_max_bytes,
+            self._data_file_max_bytes,
+        )
 
-        for rel_path in ordered:
-            abs_path = root / rel_path
-            if not abs_path.is_file():
-                continue
-            if _should_skip(
-                rel_path,
-                abs_path,
-                self._file_max_bytes,
-                self._data_file_max_bytes,
-            ):
-                excluded.append(rel_path)
-                continue
-            try:
-                content = abs_path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                excluded.append(rel_path)
-                continue
 
-            # 32자 여유는 프롬프트에 붙는 "--- FILE: path ---" / 라인 번호 접두사 등
-            # 프레이밍 오버헤드 근사치. 정확한 토큰 산정은 아니지만 보수적으로 잡아 예산 초과를 막는다.
-            entry_chars = len(content) + len(rel_path) + 32
-            if total_chars + entry_chars > max_chars:
-                excluded.append(rel_path)
-                continue
+def _build_dump_sync(
+    root: Path,
+    ordered: list[str],
+    changed_set: set[str],
+    budget: TokenBudget,
+    file_max_bytes: int,
+    data_file_max_bytes: int,
+) -> FileDump:
+    """순수 동기 파일 수집. `collect()` 가 스레드로 오프로드해 호출한다.
 
-            entries.append(
-                FileEntry(
-                    path=rel_path,
-                    content=content,
-                    size_bytes=len(content.encode("utf-8")),
-                    is_changed=rel_path in changed_set,
-                )
+    두 종류의 제외를 구분한다:
+      - filter_excluded : 바이너리/미디어/크기 한도 등 **정책상 제외**. PR 에 이미지만
+                         변경돼도 무조건 들어간다 — "예산 초과" 신호로 쓰면 안 된다.
+      - budget_trimmed  : 토큰 예산이 부족해 **컨텍스트에서 잘려 나간** 파일.
+                          이것만이 `exceeded_budget` 판정의 근거.
+    이전에는 둘을 합쳐 `excluded` 에 넣어 바이너리 파일 포함 PR 이 "예산 초과" 로 오진됐다.
+    """
+    entries: list[FileEntry] = []
+    filter_excluded: list[str] = []
+    budget_trimmed: list[str] = []
+    total_chars = 0
+    max_chars = budget.max_chars()
+
+    for rel_path in ordered:
+        abs_path = root / rel_path
+        if not abs_path.is_file():
+            continue
+        if _should_skip(rel_path, abs_path, file_max_bytes, data_file_max_bytes):
+            filter_excluded.append(rel_path)
+            continue
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            filter_excluded.append(rel_path)
+            continue
+
+        # 32자 여유는 프롬프트에 붙는 "--- FILE: path ---" / 라인 번호 접두사 등 프레이밍
+        # 오버헤드 근사치. 정확한 토큰 산정은 아니지만 보수적으로 잡아 예산 초과를 막는다.
+        entry_chars = len(content) + len(rel_path) + 32
+        if total_chars + entry_chars > max_chars:
+            budget_trimmed.append(rel_path)
+            continue
+
+        entries.append(
+            FileEntry(
+                path=rel_path,
+                content=content,
+                size_bytes=len(content.encode("utf-8")),
+                is_changed=rel_path in changed_set,
             )
-            total_chars += entry_chars
-
-        # exceeded 판정 기준:
-        # (1) 변경 파일 중 하나라도 예산 때문에 제외됐다면 → 리뷰 품질이 크게 떨어지므로 exceeded
-        # (2) 전체 예산을 꽉 채웠다면(>=)  → 프롬프트 뒤쪽이 잘렸을 가능성 높음
-        # use case 레이어에서 (1)에 해당하는 경우에만 리뷰 대신 "예산 초과" 코멘트를 게시.
-        exceeded = any(p for p in excluded if p in changed_set) or total_chars >= max_chars
-
-        # 관측성: 필터 효과를 매 리뷰마다 한 줄로 남긴다. 토큰 예산 튜닝/Tier 2 필터
-        # 추가 판단에 근거 자료로 쓴다.
-        logger.info(
-            "file dump: included=%d excluded=%d chars=%d/%d (%.1f%%) exceeded=%s",
-            len(entries),
-            len(excluded),
-            total_chars,
-            max_chars,
-            100.0 * total_chars / max_chars if max_chars else 0.0,
-            exceeded,
         )
+        total_chars += entry_chars
 
-        return FileDump(
-            entries=tuple(entries),
-            total_chars=total_chars,
-            excluded=tuple(excluded),
-            exceeded_budget=exceeded,
-            budget=budget,
-        )
+    # exceeded_budget: 오직 **예산 때문에 잘린** 경우만 True 로 잡는다.
+    #   (1) 변경 파일 중 하나라도 budget_trimmed 에 있으면 리뷰 품질 급락
+    #   (2) 전체 예산을 꽉 채웠으면 프롬프트 뒤쪽이 잘렸을 가능성
+    exceeded = any(p in changed_set for p in budget_trimmed) or total_chars >= max_chars
 
+    # 운영 관측용 `excluded` 는 두 카테고리 합집합(순서: budget → filter) 으로 유지.
+    # 프롬프트 budget notice 에서 "왜 이 파일이 빠졌는가" 를 운영자가 훑을 수 있게.
+    excluded = budget_trimmed + filter_excluded
 
-def _git_ls_files(root: Path) -> list[str]:
-    result = subprocess.run(  # noqa: S603
-        ["git", "-C", str(root), "ls-files"],
-        capture_output=True,
-        text=True,
-        check=True,
+    logger.info(
+        "file dump: included=%d filter_excluded=%d budget_trimmed=%d "
+        "chars=%d/%d (%.1f%%) exceeded=%s",
+        len(entries),
+        len(filter_excluded),
+        len(budget_trimmed),
+        total_chars,
+        max_chars,
+        100.0 * total_chars / max_chars if max_chars else 0.0,
+        exceeded,
     )
-    return [line for line in result.stdout.splitlines() if line]
+
+    return FileDump(
+        entries=tuple(entries),
+        total_chars=total_chars,
+        excluded=tuple(excluded),
+        exceeded_budget=exceeded,
+        budget=budget,
+    )
+
+
+async def _git_ls_files(root: Path) -> list[str]:
+    # `-z` : NUL 구분자로 출력 → 한글/공백/따옴표 등 특수문자 파일명도 C-style escape 없이
+    # 원형 그대로 전달된다. 기본 splitlines 경로는 이런 이름을 `"..."` 로 감싸 `Path.is_file()`
+    # 검사가 통째로 실패한다.
+    proc = await asyncio.create_subprocess_exec(
+        "git", "-C", str(root), "ls-files", "-z",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git ls-files failed: {stderr.decode(errors='replace').strip()}"
+        )
+    return [name for name in stdout.decode("utf-8", errors="replace").split("\0") if name]
 
 
 def _sort_by_priority(paths: list[str], changed: set[str]) -> list[str]:

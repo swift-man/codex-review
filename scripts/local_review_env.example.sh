@@ -27,4 +27,7 @@ export DATA_FILE_MAX_BYTES="20000"
 # --- Server ---
 export HOST="127.0.0.1"
 export PORT="8000"
+# 동시에 처리할 리뷰 개수. 1 이면 완전 직렬 (기본). 2~ 로 올리면 PR 이 동시에 들어왔을 때
+# 병렬 처리. Codex 쿼터 여유와 맞춰 조절한다.
+export REVIEW_CONCURRENCY="1"
 # export DRY_RUN="1"    # uncomment to log reviews without posting
