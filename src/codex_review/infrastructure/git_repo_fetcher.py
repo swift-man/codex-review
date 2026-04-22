@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -9,6 +10,10 @@ from urllib.parse import urlsplit, urlunsplit
 from codex_review.domain import PullRequest
 
 logger = logging.getLogger(__name__)
+
+# `https://user:token@host/...` 형태의 자격 증명을 포함한 URL 을 찾아 userinfo 만 마스킹.
+# 예외 메시지·stderr 텍스트 안에서도 토큰을 노출하지 않도록 전역 마스킹에 쓴다.
+_URL_WITH_USERINFO = re.compile(r"(?P<scheme>https?)://[^/@\s]+:[^/@\s]+@")
 
 
 class _RepoLockRegistry:
@@ -101,12 +106,7 @@ def _inject_token(clone_url: str, token: str) -> str:
 
 
 def _mask_token_in_url(value: str) -> str:
-    """`https://x-access-token:<tok>@host/path` → `https://***@host/path`.
-
-    디버그 로그에 원문을 찍으면 커맨드라인 인자가 그대로 남아 토큰이 유출된다.
-    `logging_utils._SECRET_PATTERN` 은 `record.args` 를 마스킹하지 못하므로 **기록 직전**
-    에 마스킹해야 한다.
-    """
+    """`https://x-access-token:<tok>@host/path` → `https://***@host/path` (단일 URL)."""
     parts = urlsplit(value)
     if parts.scheme in ("http", "https") and parts.username:
         host = parts.hostname or ""
@@ -116,10 +116,19 @@ def _mask_token_in_url(value: str) -> str:
     return value
 
 
+def _mask_tokens_in_text(text: str) -> str:
+    """텍스트에 섞여 있는 모든 `scheme://user:token@` 패턴을 `scheme://***@` 로 치환.
+
+    git 이 stderr 에 `fatal: unable to access 'https://x-access-token:TOKEN@github...'`
+    처럼 URL 을 그대로 출력하는 경우가 있어, 예외 메시지·로그에 붙이기 전 반드시 마스킹.
+    """
+    return _URL_WITH_USERINFO.sub(r"\g<scheme>://***@", text)
+
+
 async def _run(cmd: list[str], *, check: bool = True) -> None:
     # 기록 직전 토큰이 포함된 URL 을 마스킹한다 (URL 형태가 아니면 원본 그대로).
-    masked = [_mask_token_in_url(arg) for arg in cmd[1:]]
-    logger.debug("git %s", " ".join(masked))
+    masked_args = [_mask_token_in_url(arg) for arg in cmd[1:]]
+    logger.debug("git %s", " ".join(masked_args))
     # stdout 은 소비하지 않으므로 DEVNULL 로 — 파이프 버퍼링/메모리 오버헤드 제거.
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -128,7 +137,10 @@ async def _run(cmd: list[str], *, check: bool = True) -> None:
     )
     _, stderr = await proc.communicate()
     if check and proc.returncode != 0:
+        # git 이 stderr 에 토큰을 포함한 URL 을 실어 보낼 수 있다 (fatal: unable to access ...).
+        # 예외 메시지·예외 추적 시스템에 토큰이 남지 않도록 stderr 도 통째로 마스킹.
+        safe_stderr = _mask_tokens_in_text(stderr.decode(errors="replace").strip())
         raise RuntimeError(
-            f"git command failed ({proc.returncode}): {' '.join(cmd[:2])}...\n"
-            f"{stderr.decode(errors='replace').strip()}"
+            f"git command failed ({proc.returncode}): "
+            f"{' '.join(masked_args[:2])}...\n{safe_stderr}"
         )

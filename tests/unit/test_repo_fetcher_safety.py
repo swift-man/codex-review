@@ -171,6 +171,56 @@ async def test_remote_url_restored_on_cancellation_too(
     assert restore_calls, "취소 경로에서도 URL 복구가 실행돼야 한다"
 
 
+async def test_exception_message_masks_tokens_in_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """회귀 방지(codex inline): git 이 stderr 에 authed URL 을 실어 보내도 예외 메시지엔
+    토큰이 남지 않아야 한다. 실제로 `git clone` 실패는 stderr 에 URL 이 포함된 메시지를
+    낼 수 있다.
+    """
+
+    class _FailingProc:
+        returncode = 128
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            # git 이 내는 전형적인 실패 메시지 — URL 에 토큰 포함.
+            stderr = (
+                b"fatal: unable to access "
+                b"'https://x-access-token:SECRET123@github.com/o/r.git/': "
+                b"The requested URL returned error: 404\n"
+            )
+            return b"", stderr
+
+    async def fake_create(*_args: Any, **_kwargs: Any) -> _FailingProc:
+        return _FailingProc()
+
+    monkeypatch.setattr(
+        "codex_review.infrastructure.git_repo_fetcher.asyncio.create_subprocess_exec",
+        fake_create,
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        await git_repo_fetcher._run([
+            "git", "clone", "https://x-access-token:SECRET123@github.com/o/r.git", "/tmp/r",
+        ])
+
+    msg = str(exc.value)
+    assert "SECRET123" not in msg, "예외 메시지에 토큰이 노출돼선 안 된다"
+    assert "***@github.com" in msg, "URL 은 마스킹된 형태로 남아야 한다"
+
+
+def test_mask_tokens_in_text_handles_multiple_urls() -> None:
+    text = (
+        "first https://x-access-token:AAA@github.com/a.git fail\n"
+        "second https://user:BBB@other.example/b.git also fail"
+    )
+    masked = git_repo_fetcher._mask_tokens_in_text(text)
+    assert "AAA" not in masked
+    assert "BBB" not in masked
+    assert "***@github.com" in masked
+    assert "***@other.example" in masked
+
+
 def test_mask_token_in_url_strips_userinfo() -> None:
     masked = git_repo_fetcher._mask_token_in_url(
         "https://x-access-token:SECRET123@github.com/o/r.git"
