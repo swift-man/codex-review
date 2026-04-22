@@ -4,8 +4,8 @@
 """
 
 import json
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 import jwt
 import pytest
+import pytest_asyncio
 
 from codex_review.application.review_pr_use_case import ReviewPullRequestUseCase
 from codex_review.domain import (
@@ -167,53 +168,55 @@ async def test_use_case_passes_result_through_when_no_findings() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
-def stubbed_github(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+@pytest_asyncio.fixture()
+async def stubbed_github(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Any]:
     """Factory: returns `(make_client, posts)` where make_client(*, responses, ...)
-    builds a GitHubAppClient wired to a MockTransport.  The `responses` list is
-    consumed in order for each `/reviews` POST; elements can be either
-    `httpx.Response` (success) or an `int` status code (responds with that status).
+    builds a GitHubAppClient wired to a MockTransport.
+
+    `pytest_asyncio.fixture` 로 async teardown 을 돌려 `async with httpx.AsyncClient(...)`
+    를 쓰게 한다 — 이전 구현은 동기 teardown 에서 `run_until_complete(aclose())` 를 불러
+    이벤트 루프 충돌 위험이 있었다.
     """
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
     posts: list[httpx.Request] = []
-    closers: list[httpx.AsyncClient] = []
 
-    def make_client(
-        *, responses: list[Any] | None = None, review_model_label: str | None = None
-    ) -> GitHubAppClient:
-        response_queue = list(responses or [])
+    async with AsyncExitStack() as stack:
 
-        def handler(req: httpx.Request) -> httpx.Response:
-            if req.url.path.endswith("/access_tokens"):
-                return httpx.Response(
-                    200, json={"token": "ITOK", "expires_at": "2026-04-22T00:00:00Z"}
-                )
-            if "/reviews" in req.url.path and req.method == "POST":
-                posts.append(req)
-                if not response_queue:
-                    return httpx.Response(200, json={})
-                nxt = response_queue.pop(0)
-                if isinstance(nxt, int):
-                    return httpx.Response(nxt, json={"message": "fail"})
-                return nxt
-            return httpx.Response(200, json={})
+        def make_client(
+            *, responses: list[Any] | None = None, review_model_label: str | None = None
+        ) -> GitHubAppClient:
+            response_queue = list(responses or [])
 
-        http_client = httpx.AsyncClient(
-            base_url="https://api.github.com", transport=httpx.MockTransport(handler)
-        )
-        closers.append(http_client)
-        return GitHubAppClient(
-            app_id=1,
-            private_key_pem="-",
-            http_client=http_client,
-            review_model_label=review_model_label,
-        )
+            def handler(req: httpx.Request) -> httpx.Response:
+                if req.url.path.endswith("/access_tokens"):
+                    return httpx.Response(
+                        200, json={"token": "ITOK", "expires_at": "2026-04-22T00:00:00Z"}
+                    )
+                if "/reviews" in req.url.path and req.method == "POST":
+                    posts.append(req)
+                    if not response_queue:
+                        return httpx.Response(200, json={})
+                    nxt = response_queue.pop(0)
+                    if isinstance(nxt, int):
+                        return httpx.Response(nxt, json={"message": "fail"})
+                    return nxt
+                return httpx.Response(200, json={})
 
-    yield make_client, posts
+            http_client = httpx.AsyncClient(
+                base_url="https://api.github.com",
+                transport=httpx.MockTransport(handler),
+            )
+            # ExitStack 이 teardown 시 모든 클라이언트를 자동 정리 → 각자의 `async with`
+            # 를 일일이 쓸 필요가 없다.
+            stack.push_async_callback(http_client.aclose)
+            return GitHubAppClient(
+                app_id=1,
+                private_key_pem="-",
+                http_client=http_client,
+                review_model_label=review_model_label,
+            )
 
-    for c in closers:
-        import asyncio
-        asyncio.get_event_loop().run_until_complete(c.aclose())
+        yield make_client, posts
 
 
 def _review_result_with_inline() -> ReviewResult:

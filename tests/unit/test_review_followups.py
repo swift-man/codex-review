@@ -174,6 +174,54 @@ async def test_expires_at_with_z_suffix_is_parsed_natively(
 # ---------------------------------------------------------------------------
 
 
+async def test_fetch_pull_request_follows_link_header_not_page_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """회귀(gemini): pagination 은 `Link: rel=next` 헤더 존재 여부로 판정돼야 한다.
+    `len(files) < 100` 기반의 이전 구현은 per_page 값 변화나 페이지 크기 불일치에 취약.
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/access_tokens"):
+            return httpx.Response(
+                200, json={"token": "T", "expires_at": "2099-01-01T00:00:00Z"}
+            )
+        if req.url.path.endswith("/pulls/5"):
+            return httpx.Response(
+                200,
+                json={
+                    "title": "t", "body": "",
+                    "head": {"sha": "a", "ref": "f",
+                             "repo": {"clone_url": "https://x.git"}},
+                    "base": {"sha": "b", "ref": "main"},
+                    "draft": False,
+                },
+            )
+        if "/pulls/5/files" in req.url.path:
+            # 첫 페이지: 100개짜리 파일 (꽉 찼지만) — Link next 없음 → 반복 중단돼야 함.
+            if "page=2" not in str(req.url):
+                files = [
+                    {"filename": f"p{i}.py", "patch": f"@@ -1,1 +1,1 @@\n line{i}"}
+                    for i in range(100)
+                ]
+                # 의도적으로 `rel=next` 를 포함하지 않음. 이전 구현이면 len==100 이라
+                # 두 번째 페이지를 요청했을 것.
+                return httpx.Response(200, json=files)
+            # 페이지 2 가 호출되면 이 테스트 전제가 깨진다 — 500 으로 실패를 명시.
+            return httpx.Response(500, json={"message": "should not be called"})
+        return httpx.Response(404)
+
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    async with httpx.AsyncClient(
+        base_url="https://api.github.com", transport=httpx.MockTransport(handler)
+    ) as http_client:
+        client = GitHubAppClient(app_id=1, private_key_pem="-", http_client=http_client)
+        pr = await client.fetch_pull_request(RepoRef("o", "r"), number=5, installation_id=7)
+
+    assert len(pr.changed_files) == 100
+    # 페이지 2 호출이 없었음은 transport 의 500 fallback 이 트리거되지 않은 것으로 확인.
+
+
 async def test_fetch_pull_request_issues_meta_and_first_files_in_parallel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -198,8 +246,7 @@ async def test_fetch_pull_request_issues_meta_and_first_files_in_parallel(
     async def fake_request(
         method: str, path: str, *, auth: str, body: object | None = None
     ) -> object:
-        # token 발급은 이 테스트의 측정 대상이 아니라 즉시 반환 — 그래야 이후 PR 메타/files
-        # 두 호출만 depth=2 로 정확히 관찰 가능.
+        # token 발급은 이 테스트의 측정 대상이 아니라 즉시 반환.
         if "/access_tokens" in path:
             return {"token": "T", "expires_at": "2099-01-01T00:00:00Z"}
 
@@ -212,16 +259,30 @@ async def test_fetch_pull_request_issues_meta_and_first_files_in_parallel(
             in_flight -= 1
         if path.endswith("/pulls/5"):
             return _PR_JSON
-        if "/pulls/5/files" in path:
-            return [{"filename": "a.py", "patch": "@@ -1,1 +1,1 @@\n x"}]
         return {}
+
+    async def fake_get_page_with_next(
+        url_or_path: str, *, auth: str
+    ) -> tuple[object, str | None]:
+        # 첫 페이지 files 호출은 `_get_page_with_next` 를 거친다 — 여기서도 in-flight 카운트.
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await release.wait()
+        finally:
+            in_flight -= 1
+        if "/pulls/5/files" in url_or_path:
+            return [{"filename": "a.py", "patch": "@@ -1,1 +1,1 @@\n x"}], None
+        return [], None
 
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
     async with httpx.AsyncClient(base_url="https://api.github.com") as http_client:
         client = GitHubAppClient(app_id=1, private_key_pem="-", http_client=http_client)
-        # 두 호출이 동시에 대기 상태에 들어간 것을 확인한 뒤 한꺼번에 풀어 준다.
+        # PR 메타 / files 첫 페이지가 각각 다른 경로를 타므로 둘 다 훅 건다.
         monkeypatch.setattr(client, "_request", fake_request)
+        monkeypatch.setattr(client, "_get_page_with_next", fake_get_page_with_next)
 
         async def gate() -> None:
             # in_flight 가 2 가 될 때까지 대기 (두 호출이 모두 시작됨).

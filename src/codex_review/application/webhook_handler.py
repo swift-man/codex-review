@@ -79,32 +79,53 @@ class WebhookHandler:
     async def stop(self) -> None:
         """Graceful shutdown — 진행 중 리뷰는 완료시키고 큐 잔여는 drain 후 종료.
 
-        타임아웃(기본 60s) 을 넘기면 워커를 강제 취소한다 — 운영 환경의 짧은 graceful
-        window (k8s/systemd) 를 넘지 않도록 제한을 둔다.
+        큐가 가득 찬 상태에서도 `stop()` 이 블록되면 안 된다. 이전 구현은
+        `await self._queue.put(None)` 이 큐 가득 시 무한 대기해, 짧은 graceful window
+        안에 종료를 보장하지 못했다.
+        수정: tombstone 은 `put_nowait` 로 비블로킹 주입 → 하나라도 실패하면 즉시 강제
+        취소 경로로 전환해 빠른 종료를 보장한다.
         """
-        # 각 워커 앞으로 tombstone 하나씩 — 진행 중 작업을 완료한 뒤 자연 종료.
+        enqueued = 0
         for _ in self._workers:
-            await self._queue.put(None)
+            try:
+                self._queue.put_nowait(None)
+                enqueued += 1
+            except asyncio.QueueFull:
+                # 나머지 tombstone 은 못 넣으므로 즉시 강제 취소 경로로 전환.
+                break
 
-        try:
-            async with asyncio.timeout(self._shutdown_timeout):
-                await asyncio.gather(*self._workers, return_exceptions=True)
-        except TimeoutError:
+        if enqueued == len(self._workers):
+            # 정상 경로: 모든 워커에 tombstone 전달됨. 진행 중 작업 완료 후 자연 종료.
+            try:
+                async with asyncio.timeout(self._shutdown_timeout):
+                    await asyncio.gather(*self._workers, return_exceptions=True)
+            except TimeoutError:
+                logger.warning(
+                    "graceful shutdown exceeded %.0fs; cancelling workers",
+                    self._shutdown_timeout,
+                )
+                self._cancel_workers()
+        else:
             logger.warning(
-                "graceful shutdown exceeded %.0fs; cancelling workers",
-                self._shutdown_timeout,
+                "webhook queue full at shutdown (tombstones %d/%d); cancelling workers",
+                enqueued, len(self._workers),
             )
-            for task in self._workers:
-                task.cancel()
-            for task in self._workers:
-                with contextlib.suppress(asyncio.CancelledError):
-                    try:
-                        await task
-                    except Exception:
-                        logger.exception("worker task crashed during shutdown")
+            self._cancel_workers()
+
+        # 최종 정리 — CancelledError 는 정상 신호로 suppress, 다른 예외는 가시성 위해 로그.
+        for task in self._workers:
+            with contextlib.suppress(asyncio.CancelledError):
+                try:
+                    await task
+                except Exception:
+                    logger.exception("worker task crashed during shutdown")
 
         self._workers.clear()
         logger.info("webhook handler stopped")
+
+    def _cancel_workers(self) -> None:
+        for task in self._workers:
+            task.cancel()
 
     # --- Verification -------------------------------------------------------
 

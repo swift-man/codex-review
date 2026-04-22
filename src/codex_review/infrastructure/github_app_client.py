@@ -140,30 +140,25 @@ class GitHubAppClient:
         pr_path = f"/repos/{repo.full_name}/pulls/{number}"
 
         # PR 메타와 첫 페이지 files 는 상호 독립적이라 병렬로 조회해 네트워크 대기 단축.
-        # TaskGroup 은 형제 태스크 중 하나가 실패하면 나머지를 자동 취소해 주므로
-        # gather + return_exceptions 보다 에러 처리가 깔끔하다. (페이지 2부터는 이전 페이지
-        # 크기를 봐야 하므로 순차 유지.)
+        # TaskGroup 은 형제 태스크 중 하나가 실패하면 나머지를 자동 취소한다.
+        # 이후 페이지는 Link 헤더(`rel=next`) 로 순차 순회.
         async with asyncio.TaskGroup() as tg:
             meta_task = tg.create_task(
                 self._request("GET", pr_path, auth=f"token {token}")
             )
             first_files_task = tg.create_task(
-                self._request(
-                    "GET",
-                    f"{pr_path}/files?per_page=100&page=1",
-                    auth=f"token {token}",
+                self._get_page_with_next(
+                    f"{pr_path}/files?per_page=100", auth=f"token {token}"
                 )
             )
         pr_data = meta_task.result()
-        first_page = first_files_task.result()
+        first_page, next_url = first_files_task.result()
         assert isinstance(pr_data, dict)
 
-        # 변경 파일 전체를 가져와야 우선순위 정렬(변경 파일 먼저)이 정확해진다.
         # per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
         changed: list[str] = []
         diff_right_lines: dict[str, frozenset[int]] = {}
-        page = 1
-        files = first_page
+        files: Any = first_page
         while True:
             if not isinstance(files, list) or not files:
                 break
@@ -184,14 +179,10 @@ class GitHubAppClient:
                         f.get("status"),
                     )
                 diff_right_lines[path] = parse_right_lines(patch)
-            # 100개 미만이면 마지막 페이지 — Link 헤더 대신 길이로 단순 판정.
-            if len(files) < 100:
+            if not next_url:
                 break
-            page += 1
-            files = await self._request(
-                "GET",
-                f"{pr_path}/files?per_page=100&page={page}",
-                auth=f"token {token}",
+            files, next_url = await self._get_page_with_next(
+                next_url, auth=f"token {token}"
             )
 
         head = pr_data["head"]
@@ -261,6 +252,34 @@ class GitHubAppClient:
 
     # --- HTTP ---------------------------------------------------------------
 
+    async def _send(
+        self,
+        method: str,
+        url_or_path: str,
+        *,
+        auth: str,
+        body: object | None = None,
+    ) -> httpx.Response:
+        """공통 헤더를 붙여 요청을 보내고 4xx/5xx 를 HTTPStatusError 로 승격한다."""
+        headers = {
+            "Authorization": auth,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "codex-review-bot",
+        }
+        resp = await self._http.request(method, url_or_path, headers=headers, json=body)
+        if resp.status_code >= 400:
+            logger.error(
+                "GitHub %s %s failed: %s %s",
+                method, url_or_path, resp.status_code, resp.text[:500],
+            )
+            raise httpx.HTTPStatusError(
+                f"{resp.status_code} {resp.reason_phrase}",
+                request=resp.request,
+                response=resp,
+            )
+        return resp
+
     async def _request(
         self,
         method: str,
@@ -270,28 +289,23 @@ class GitHubAppClient:
         body: object | None = None,
     ) -> Any:
         """Issue a single JSON REST call. `path` 는 base_url 에 붙는 상대 경로."""
-        headers = {
-            "Authorization": auth,
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "codex-review-bot",
-        }
-        resp = await self._http.request(method, path, headers=headers, json=body)
-        # httpx 는 4xx/5xx 를 예외로 승격시키지 않으므로 명시적으로 raise — `post_review` 가
-        # 422 를 구분해서 잡아야 하기 때문에 HTTPStatusError 가 필요.
-        if resp.status_code >= 400:
-            logger.error(
-                "GitHub %s %s failed: %s %s",
-                method, path, resp.status_code, resp.text[:500],
-            )
-            raise httpx.HTTPStatusError(
-                f"{resp.status_code} {resp.reason_phrase}",
-                request=resp.request,
-                response=resp,
-            )
+        resp = await self._send(method, path, auth=auth, body=body)
         if not resp.content:
             return {}
         return resp.json()
+
+    async def _get_page_with_next(
+        self, url_or_path: str, *, auth: str
+    ) -> tuple[Any, str | None]:
+        """Paginated GET — 본문 JSON 과 `Link: rel=next` URL 을 함께 돌려준다.
+
+        `len(body) < per_page` 로 마지막 페이지를 추정하는 건 per_page 나 API 스펙 변경에
+        취약하다. GitHub 공식 가이드는 `Link` 헤더의 `rel="next"` 존재 여부를 기준 삼는 것.
+        """
+        resp = await self._send("GET", url_or_path, auth=auth)
+        body: Any = resp.json() if resp.content else {}
+        next_url = resp.links.get("next", {}).get("url")
+        return body, next_url
 
 
 def _finding_to_comment(f: Finding) -> dict[str, object]:

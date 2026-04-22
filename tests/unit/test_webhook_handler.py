@@ -314,3 +314,58 @@ async def test_concurrency_2_runs_two_in_parallel() -> None:
     engine = _SlowEngine()
     await _run_handler_with_engine(engine, concurrency=2)
     assert engine.peak == 2
+
+
+async def test_stop_does_not_deadlock_when_queue_is_full() -> None:
+    """회귀(codex/gemini 지적): 큐가 가득 찬 상태에서 `stop()` 이 `await put(None)` 으로
+    무한 대기하면 안 된다. 타임아웃보다 훨씬 빨리 종료되는지 확인.
+    """
+    github = FakeGitHub(pr_to_return=_sample_pr())
+    # engine.review 가 절대 완료되지 않는 엔진 — 워커는 영원히 busy, 큐는 가득 참.
+    release = asyncio.Event()
+
+    class _BlockingEngine:
+        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+            await release.wait()  # forever
+            return ReviewResult(summary="x", event=ReviewEvent.COMMENT)
+
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(Path(".")),
+        file_collector=FakeCollector(FileDump(entries=(), total_chars=0)),
+        engine=_BlockingEngine(),
+        max_input_tokens=1000,
+    )
+    handler = WebhookHandler(
+        secret=SECRET,
+        github=github,
+        use_case=use_case,
+        concurrency=1,
+        queue_maxsize=1,             # 큐는 곧바로 가득 찬다.
+        shutdown_timeout=0.5,        # 타임아웃 자체는 0.5s — 비블로킹 경로가 먼저 차단해야 한다.
+    )
+    await handler.start()
+
+    # 워커가 busy 에 돌입할 때까지 1개 밀어넣고, 이어서 2개를 더 넣어 큐를 가득 채운다.
+    payload = {
+        "action": "opened",
+        "pull_request": {"draft": False, "number": 42},
+        "repository": {"full_name": "o/r"},
+        "installation": {"id": 7},
+    }
+    # 1) 워커가 꺼내 블로킹 시작
+    await handler.accept("pull_request", "d-1", payload)
+    # 2) 큐에 남아 대기 중 (queue_depth=1 = maxsize)
+    await handler.accept("pull_request", "d-2", payload)
+    # 3) 이후 들어오는 건 503 queue-full. 그래도 stop 은 블록되면 안 됨.
+
+    started = asyncio.get_running_loop().time()
+    # put_nowait + 즉시 취소 경로를 타면 shutdown_timeout(0.5s) 보다 훨씬 빨리 종료된다.
+    await asyncio.wait_for(handler.stop(), timeout=2.0)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    # 1.5s 이내 종료면 "블록 없이 즉시 취소 경로" 를 탄 것.
+    assert elapsed < 1.5, f"stop() 이 {elapsed:.2f}s 걸림 — 큐 full 시 블록됐을 가능성"
+
+    # teardown
+    release.set()

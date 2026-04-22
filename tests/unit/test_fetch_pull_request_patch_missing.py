@@ -1,7 +1,6 @@
 """Regression coverage for GitHub `patch` omission handling in fetch_pull_request."""
 
 import logging
-from collections.abc import Iterator
 
 import httpx
 import jwt
@@ -34,39 +33,30 @@ def _router(files_payload: list[dict]) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-@pytest.fixture()
-def client_factory(monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
-    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
-    created: list[httpx.AsyncClient] = []
-
-    async def make(files_payload: list[dict]) -> GitHubAppClient:
-        http_client = httpx.AsyncClient(
-            base_url="https://api.github.com", transport=_router(files_payload)
-        )
-        created.append(http_client)
-        return GitHubAppClient(app_id=1, private_key_pem="-", http_client=http_client)
-
-    yield make
-
-    for c in created:
-        import asyncio
-        asyncio.get_event_loop().run_until_complete(c.aclose())
-
-
 async def test_patch_missing_file_emits_warning_and_yields_empty_line_set(
-    client_factory, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """GitHub 이 `patch` 키를 생략한 파일에 대해:
     (1) 해당 파일의 diff_right_lines 가 빈 집합으로 설정되고
     (2) 운영자가 알아볼 수 있도록 warning 로그가 남아야 한다.
+
+    `async with httpx.AsyncClient(...)` 를 테스트 내부에서 직접 관리해 fixture teardown
+    단계의 이벤트 루프 충돌(동기 fixture 에서 `run_until_complete` 호출)을 피한다.
     """
-    client = await client_factory([
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+    transport = _router([
         {"filename": "small.py", "patch": "@@ -1,1 +1,1 @@\n hello"},
         {"filename": "huge.bin", "status": "modified"},  # patch 누락
     ])
-
-    with caplog.at_level(logging.WARNING):
-        pr = await client.fetch_pull_request(RepoRef("o", "r"), number=5, installation_id=7)
+    async with httpx.AsyncClient(
+        base_url="https://api.github.com", transport=transport
+    ) as http_client:
+        client = GitHubAppClient(app_id=1, private_key_pem="-", http_client=http_client)
+        with caplog.at_level(logging.WARNING):
+            pr = await client.fetch_pull_request(
+                RepoRef("o", "r"), number=5, installation_id=7
+            )
 
     assert pr.diff_right_lines["small.py"] == frozenset({1})
     assert pr.diff_right_lines["huge.bin"] == frozenset()
@@ -77,13 +67,18 @@ async def test_patch_missing_file_emits_warning_and_yields_empty_line_set(
 
 
 async def test_patch_present_does_not_emit_warning(
-    client_factory, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    client = await client_factory([
-        {"filename": "a.py", "patch": "@@ -1,1 +1,1 @@\n hello"},
-    ])
-
-    with caplog.at_level(logging.WARNING):
-        await client.fetch_pull_request(RepoRef("o", "r"), number=5, installation_id=7)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+    transport = _router([{"filename": "a.py", "patch": "@@ -1,1 +1,1 @@\n hello"}])
+    async with httpx.AsyncClient(
+        base_url="https://api.github.com", transport=transport
+    ) as http_client:
+        client = GitHubAppClient(app_id=1, private_key_pem="-", http_client=http_client)
+        with caplog.at_level(logging.WARNING):
+            await client.fetch_pull_request(
+                RepoRef("o", "r"), number=5, installation_id=7
+            )
 
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
