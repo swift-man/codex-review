@@ -17,9 +17,35 @@ _REQUIRED_ENV = {
     "GITHUB_APP_PRIVATE_KEY": "-",  # load_private_key 호출 전엔 형식 검증 없음
 }
 
+# `Settings` 가 읽는 모든 alias. 테스트 시작 시 이 목록 전체를 `delenv` 하여
+# 개발자 셸·CI 환경에 남아 있던 `PORT=0` / `REVIEW_QUEUE_MAXSIZE=0` 같은 값이
+# 테스트 결과를 오염시키지 않도록 한다 (codex 리뷰).
+_ALL_ALIASES = (
+    "GITHUB_APP_ID",
+    "GITHUB_APP_PRIVATE_KEY_PATH",
+    "GITHUB_APP_PRIVATE_KEY",
+    "GITHUB_WEBHOOK_SECRET",
+    "GITHUB_API_BASE",
+    "CODEX_BIN",
+    "CODEX_MODEL",
+    "CODEX_REASONING_EFFORT",
+    "CODEX_TIMEOUT_SEC",
+    "CODEX_MAX_INPUT_TOKENS",
+    "REPO_CACHE_DIR",
+    "FILE_MAX_BYTES",
+    "DATA_FILE_MAX_BYTES",
+    "HOST",
+    "PORT",
+    "DRY_RUN",
+    "REVIEW_CONCURRENCY",
+    "REVIEW_QUEUE_MAXSIZE",
+)
+
 
 def _settings(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> Settings:
-    # `Settings()` 는 실제 환경변수를 읽는다 — 테스트 안정성을 위해 monkeypatch 로만 주입.
+    """실제 env 를 한 번 비운 뒤 필수값만 주입해 결정론적인 Settings 를 반환."""
+    for k in _ALL_ALIASES:
+        monkeypatch.delenv(k, raising=False)
     for k, v in {**_REQUIRED_ENV, **overrides}.items():
         monkeypatch.setenv(k, v)
     # 로컬 개발자의 실제 `.env` 가 테스트 결과에 영향 주지 않도록 명시적으로 무력화.
@@ -97,3 +123,31 @@ def test_empty_webhook_secret_is_rejected(monkeypatch: pytest.MonkeyPatch) -> No
     """빈 시크릿은 HMAC 검증을 사실상 무력화 — 보안 사고."""
     with pytest.raises(ValidationError):
         _settings(monkeypatch, GITHUB_WEBHOOK_SECRET="")
+
+
+def test_whitespace_only_webhook_secret_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """회귀(codex 리뷰): `min_length=1` 만으로는 `"   "` 공백 시크릿이 통과한다.
+    `StringConstraints(strip_whitespace=True, ...)` 로 공백 제거 후 길이 검사해야 한다.
+    """
+    with pytest.raises(ValidationError):
+        _settings(monkeypatch, GITHUB_WEBHOOK_SECRET="   ")
+
+
+def test_whitespace_only_host_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValidationError):
+        _settings(monkeypatch, HOST="   ")
+
+
+def test_whitespace_only_codex_model_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValidationError):
+        _settings(monkeypatch, CODEX_MODEL="\t\n ")
+
+
+def test_webhook_secret_whitespace_is_stripped_when_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """strip 후에도 내용이 남으면 정상 통과 — 주변 공백은 조용히 제거된다."""
+    s = _settings(monkeypatch, GITHUB_WEBHOOK_SECRET="  real-secret  ")
+    assert s.github_webhook_secret == "real-secret"

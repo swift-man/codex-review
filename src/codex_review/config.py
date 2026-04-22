@@ -1,7 +1,13 @@
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import Field, StringConstraints
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 공백만으로 이뤄진 시크릿·호스트·모델명을 차단 — 빈 문자열뿐 아니라 `"   "` 도 거절해야
+# HMAC 무력화·바인딩 실패 같은 조용한 설정 사고를 기동 단계에서 막을 수 있다 (codex 리뷰).
+# `strip_whitespace=True` 로 주변 공백을 제거한 뒤 `min_length=1` 을 평가한다.
+NonBlankStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class Settings(BaseSettings):
@@ -21,12 +27,12 @@ class Settings(BaseSettings):
         default=None, alias="GITHUB_APP_PRIVATE_KEY_PATH"
     )
     github_app_private_key: str | None = Field(default=None, alias="GITHUB_APP_PRIVATE_KEY")
-    github_webhook_secret: str = Field(..., min_length=1, alias="GITHUB_WEBHOOK_SECRET")
+    github_webhook_secret: NonBlankStr = Field(..., alias="GITHUB_WEBHOOK_SECRET")
     github_api_base: str = Field(default="https://api.github.com", alias="GITHUB_API_BASE")
 
     # Codex CLI — 음수/0 타임아웃이나 토큰 한도는 리뷰를 즉시 실패시키므로 `gt=0` 로 고정.
     codex_bin: str = Field(default="codex", alias="CODEX_BIN")
-    codex_model: str = Field(default="gpt-5.4", min_length=1, alias="CODEX_MODEL")
+    codex_model: NonBlankStr = Field(default="gpt-5.4", alias="CODEX_MODEL")
     codex_reasoning_effort: str = Field(default="high", alias="CODEX_REASONING_EFFORT")
     codex_timeout_sec: int = Field(default=600, gt=0, alias="CODEX_TIMEOUT_SEC")
     codex_max_input_tokens: int = Field(default=300_000, gt=0, alias="CODEX_MAX_INPUT_TOKENS")
@@ -39,26 +45,15 @@ class Settings(BaseSettings):
     data_file_max_bytes: int = Field(default=20_000, gt=0, alias="DATA_FILE_MAX_BYTES")
 
     # Server — 포트는 TCP 유효 범위(1–65535) 로 제한.
-    host: str = Field(default="127.0.0.1", min_length=1, alias="HOST")
+    host: NonBlankStr = Field(default="127.0.0.1", alias="HOST")
     port: int = Field(default=8000, ge=1, le=65535, alias="PORT")
     dry_run: bool = Field(default=False, alias="DRY_RUN")
     # 동시에 처리할 리뷰 최대 개수. 1 이면 직렬. 2~ 로 올리면 병렬 처리. 0/음수는 의미 없음.
     review_concurrency: int = Field(default=1, gt=0, alias="REVIEW_CONCURRENCY")
     # 웹훅 큐 상한. None 이면 `review_concurrency * 10` 으로 자동 계산. 가득 차면 503 반환.
-    # 명시적으로 주어진 경우 반드시 양수여야 한다 — 0 은 "모든 요청 즉시 거절"을 의미해
-    # 사고 가능성이 높다.
-    review_queue_maxsize: int | None = Field(default=None, alias="REVIEW_QUEUE_MAXSIZE")
-
-    @field_validator("review_queue_maxsize")
-    @classmethod
-    def _validate_queue_maxsize(cls, v: int | None) -> int | None:
-        # Field(..., gt=0) 은 `int | None` 에 직접 못 걸린다 (None 에서 실패).
-        # 수동 validator 로 "None 이거나 양수" 조건만 강제.
-        if v is not None and v <= 0:
-            raise ValueError(
-                f"REVIEW_QUEUE_MAXSIZE must be a positive integer or unset; got {v}"
-            )
-        return v
+    # pydantic V2 는 `int | None` 타입에 `gt=0` 을 걸어도 None 은 검증을 건너뛰므로 별도
+    # validator 없이 "None 이거나 양수" 계약이 자동 적용된다 (gemini 리뷰).
+    review_queue_maxsize: int | None = Field(default=None, gt=0, alias="REVIEW_QUEUE_MAXSIZE")
 
     def load_private_key(self) -> str:
         if self.github_app_private_key:
