@@ -71,10 +71,16 @@ class WebhookHandler:
         queue_maxsize: int | None = None,
         shutdown_timeout: float = _DEFAULT_SHUTDOWN_TIMEOUT,
     ) -> None:
+        # 이 클래스에 도달하기 전에 `Settings` 계층이 `concurrency > 0`, `queue_maxsize
+        # is None or > 0` 을 강제하므로 런타임 방어(`max(1, …)`) 는 제거했다 —
+        # 설정과 비즈니스 로직 사이 신뢰 경계를 명확하게 (gemini 리뷰).
+        if concurrency <= 0:
+            # 직접 생성 경로(테스트 등) 의 오용 방어를 최소한으로 유지.
+            raise ValueError(f"concurrency must be > 0; got {concurrency}")
         self._secret = secret.encode("utf-8")
         self._github = github
         self._use_case = use_case
-        self._concurrency = max(1, concurrency)
+        self._concurrency = concurrency
         qmax = queue_maxsize if queue_maxsize is not None else (
             self._concurrency * _DEFAULT_QUEUE_MULTIPLIER
         )
