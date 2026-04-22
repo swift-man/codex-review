@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import ssl
 import time
@@ -123,11 +124,12 @@ class GitHubAppClient:
             # GitHub installation token 은 1시간 유효. 만료 직전 요청이 실패하지 않도록 5분 여유.
             expires_at = time.time() + 55 * 60
             if expires:
-                # Python 3.11+ 의 fromisoformat 은 "Z" 접미사를 UTC 로 네이티브 지원.
-                try:
+                # Python 3.11+ 의 `datetime.fromisoformat` 은 "Z" 접미사를 UTC 로 네이티브 지원.
+                # `time.strptime/mktime` 은 naive 로 파싱해 로컬 TZ 로 해석하므로 오프셋만큼
+                # 어긋난다(예: KST 에서 9시간 일찍 만료 판정). 포맷 불일치는 의도적 무시 —
+                # 5분 여유가 있는 기본값을 그대로 사용.
+                with contextlib.suppress(ValueError):
                     expires_at = datetime.fromisoformat(expires).timestamp()
-                except ValueError:
-                    pass
             self._token_cache[installation_id] = _CachedToken(token, expires_at)
             return token
 
@@ -309,7 +311,10 @@ class GitHubAppClient:
 
 
 def _finding_to_comment(f: Finding) -> dict[str, object]:
-    return {"path": f.path, "line": f.line, "side": "RIGHT", "body": f.body}
+    # 심각도에 따라 본문 앞에 시각적 구분 접두를 붙인다. PR 화면에서 수십 개 라인 코멘트가
+    # 붙을 때 "반드시 수정" 건을 한눈에 찾기 위함. 기본(suggest)은 접두 없이 깔끔히 유지.
+    body = f"🔴 **반드시 수정** — {f.body}" if f.is_must_fix else f.body
+    return {"path": f.path, "line": f.line, "side": "RIGHT", "body": body}
 
 
 __all__ = ["GitHubAppClient", "ReviewEvent", "_default_tls_context"]
