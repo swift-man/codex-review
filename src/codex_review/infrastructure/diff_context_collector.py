@@ -103,10 +103,31 @@ class DiffContextCollector:
         # 를 숨기면 codex 단계에서 더 혼란스러운 실패로 이어진다.
         patch_budget = max(0, max_chars - overhead_chars)
 
+        # Early return: 오버헤드만으로 예산이 다 소진됐다면 patch 파일 순회해도 전부
+        # budget_trimmed 처리만 하게 된다. 불필요한 반복을 생략하고 같은 결과를 즉시
+        # 반환한다 (gemini PR #17 Minor 지적 반영). patch 가 있는 변경 파일은 "예산 컷"
+        # 으로 기록해 리뷰 본문/프롬프트 SCOPE 에 정확히 노출.
+        if patch_budget <= 0:
+            logger.warning(
+                "diff collector: overhead %d chars already exceeds budget %d — "
+                "skipping file loop, marking all patched changed files as budget-trimmed",
+                overhead_chars, max_chars,
+            )
+            all_trimmed = tuple(p for p in pr.changed_files if p in pr.diff_patches)
+            return FileDump(
+                entries=(),
+                total_chars=0,
+                excluded=all_trimmed + patch_missing,
+                exceeded_budget=True,
+                budget=budget,
+                mode=DUMP_MODE_DIFF,
+                patch_missing=patch_missing,
+            )
+
         entries: list[FileEntry] = []
         budget_trimmed: list[str] = []
         total_chars = 0
-        budget_full = patch_budget <= 0
+        budget_full = False  # early return 이후 경로이므로 예산은 양수 보장.
 
         for path in pr.changed_files:
             patch = pr.diff_patches.get(path)

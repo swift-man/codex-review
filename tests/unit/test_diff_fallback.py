@@ -315,6 +315,36 @@ async def test_diff_collector_reserves_prompt_overhead_from_budget() -> None:
     assert len(dump.entries) + len(dump.budget_trimmed) == 5
 
 
+async def test_diff_collector_early_returns_without_iterating_when_overhead_exceeds_budget() -> None:
+    """회귀 (gemini PR #17 Minor): 오버헤드가 예산을 이미 넘으면 파일 순회 루프 자체를
+    생략하는 early-return 경로를 타야 한다. estimator 가 초기 1회만 호출되고 이후
+    호출(오버헤드 재측정·최종 verify) 이 **일어나지 않음** 을 관찰해 단락 여부 확인.
+    """
+    call_count = 0
+
+    def tracking_overhead(pr: PullRequest, empty_dump: FileDump) -> int:
+        nonlocal call_count
+        call_count += 1
+        return 10_000_000  # 예산보다 훨씬 큼
+
+    collector = DiffContextCollector(overhead_estimator=tracking_overhead)
+    # 파일 많이 넣어도 루프에 진입조차 하면 안 된다.
+    patches = {f"f{i}.py": "@@ -1 +1 @@\n+x\n" for i in range(20)}
+    pr = _pr(changed=tuple(f"f{i}.py" for i in range(20)), patches=patches)
+
+    dump = await collector.collect_diff(pr, TokenBudget(max_tokens=100))
+
+    # estimator 는 초기 overhead 산정 1회만 호출돼야 한다 — 루프나 최종 verify 에서 재호출 X.
+    assert call_count == 1
+
+    # 모든 patched 변경 파일이 budget_trimmed 로 정확히 기록.
+    assert dump.entries == ()
+    assert dump.exceeded_budget is True
+    assert len(dump.budget_trimmed) == 20
+    assert dump.budget_trimmed[0] == "f0.py"      # 원본 순서 유지
+    assert dump.budget_trimmed[-1] == "f19.py"
+
+
 async def test_diff_collector_returns_empty_when_overhead_exceeds_budget() -> None:
     """오버헤드만으로 예산을 넘으면 정직하게 `exceeded_budget=True` + 빈 entries 반환.
 
