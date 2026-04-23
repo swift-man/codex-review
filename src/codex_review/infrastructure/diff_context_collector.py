@@ -168,19 +168,27 @@ class DiffContextCollector:
         각 반복은 entry 1개 제거 + prompt 1회 재생성. entries 가 더는 없어도 오버헤드
         자체가 초과인 케이스(운영자가 비정상적으로 작은 예산 설정) 는 그대로 반환 —
         상위 use case 가 "빈 덤프 → 안내 코멘트" 경로로 처리한다.
+
+        성능: 루프 안에서는 `append` 로 trimmed 목록을 쌓고(O(1) × N), 반복 종료 후
+        `pr.changed_files` 순서로 한 번에 정렬한다. 이전 구현의 `list.insert(0, ...)`
+        는 원소당 O(N) 이어서 전체 O(N²) 였음 (gemini PR #17 Suggestion 반영).
+        루프 중간 `_build_dump` 가 쓰는 길이 측정에는 순서가 영향 없으므로(목록 항목
+        수만 계산됨) 정렬은 맨 마지막에만 하면 된다.
         """
         entries = list(dump.entries)
-        budget_trimmed = list(dump.budget_trimmed)
+        # 초기 budget_trimmed 와 루프에서 추가되는 항목을 분리 관리.
+        initial_trimmed = list(dump.budget_trimmed)
+        new_victims: list[str] = []
         patch_missing = dump.patch_missing
         budget = dump.budget
 
         current_len = self._prompt_length(pr, dump)
         while current_len > max_chars and entries:
             victim = entries.pop()
-            # 축출되는 entry 의 path 를 budget_trimmed 의 **앞쪽** 에 넣어 원래 changed_files
-            # 순서 의미를 유지. (SCOPE 렌더링이 원본 순서를 추적 가능하도록.)
-            budget_trimmed.insert(0, victim.path)
-            dump = _build_dump(entries, budget_trimmed, patch_missing, budget)
+            new_victims.append(victim.path)
+            # 임시 dump — 순서는 길이 산정에 영향 없으므로 append 조합 그대로 사용.
+            tmp_trimmed = initial_trimmed + new_victims
+            dump = _build_dump(entries, tmp_trimmed, patch_missing, budget)
             new_len = self._prompt_length(pr, dump)
             logger.warning(
                 "diff collector: final prompt %d > max %d — trimmed %s "
@@ -189,4 +197,16 @@ class DiffContextCollector:
             )
             current_len = new_len
 
-        return dump
+        if not new_victims:
+            return dump
+
+        # 최종 정렬: `pr.changed_files` 의 원래 인덱스 기준으로 한 번에 sort.
+        # 리뷰어가 "어느 순서로 잘렸는가" 를 추적할 수 있도록 결정론적 순서 보장.
+        original_index = {p: i for i, p in enumerate(pr.changed_files)}
+        # 알 수 없는 path 는 리스트 맨 뒤로 (방어적).
+        sentinel = len(pr.changed_files)
+        sorted_trimmed = sorted(
+            initial_trimmed + new_victims,
+            key=lambda p: original_index.get(p, sentinel),
+        )
+        return _build_dump(entries, sorted_trimmed, patch_missing, budget)

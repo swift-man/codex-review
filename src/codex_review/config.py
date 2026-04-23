@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     codex_reasoning_effort: str = Field(default="high", alias="CODEX_REASONING_EFFORT")
     codex_timeout_sec: int = Field(default=600, gt=0, alias="CODEX_TIMEOUT_SEC")
     codex_max_input_tokens: int = Field(default=300_000, gt=0, alias="CODEX_MAX_INPUT_TOKENS")
+    # 예산 초과 시 diff-only 모드 자동 fallback 활성화 여부 (기본 True).
+    # False 로 내리면 기존 "리뷰 스킵 + 안내 코멘트" 경로만 남는다 — 리뷰 품질을
+    # 보수적으로 보장하고 싶은 운영 환경 대비 옵트아웃. (gemini PR #17 제안)
+    enable_diff_fallback: bool = Field(default=True, alias="CODEX_ENABLE_DIFF_FALLBACK")
 
     # Repo / files
     repo_cache_dir: Path = Field(

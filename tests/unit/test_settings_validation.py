@@ -39,6 +39,7 @@ _ALL_ALIASES = (
     "DRY_RUN",
     "REVIEW_CONCURRENCY",
     "REVIEW_QUEUE_MAXSIZE",
+    "CODEX_ENABLE_DIFF_FALLBACK",
 )
 
 
@@ -143,6 +144,20 @@ def test_whitespace_only_host_is_rejected(monkeypatch: pytest.MonkeyPatch) -> No
 def test_whitespace_only_codex_model_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValidationError):
         _settings(monkeypatch, CODEX_MODEL="\t\n ")
+
+
+def test_enable_diff_fallback_default_is_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """회귀 (gemini PR #17): 미설정 시 자동 fallback 이 켜져 있어야 한다 (기존 배포 동작)."""
+    s = _settings(monkeypatch)
+    assert s.enable_diff_fallback is True
+
+
+def test_enable_diff_fallback_can_be_disabled_via_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """운영자가 품질 보장 우선 정책으로 fallback 을 옵트아웃 가능해야 한다."""
+    s = _settings(monkeypatch, CODEX_ENABLE_DIFF_FALLBACK="false")
+    assert s.enable_diff_fallback is False
 
 
 def test_webhook_secret_whitespace_is_stripped_when_valid(

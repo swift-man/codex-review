@@ -62,9 +62,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 logger.error("codex auth preflight failed:\n%s", exc)
                 raise
 
-            # 컨텍스트 예산 초과 시 자동 diff-only 모드 fallback 에 쓰일 collector.
-            # 리뷰를 아예 포기하는 대신 PR unified patch 만 가지고라도 리뷰를 돌린다.
-            diff_collector = DiffContextCollector()
+            # 컨텍스트 예산 초과 시 자동 diff-only 모드 fallback.
+            # `CODEX_ENABLE_DIFF_FALLBACK=false` 로 옵트아웃 → None 주입 시 use case 는
+            # 기존 "리뷰 스킵 + 안내 코멘트" 경로로만 동작.
+            diff_collector = (
+                DiffContextCollector() if settings.enable_diff_fallback else None
+            )
 
             use_case = ReviewPullRequestUseCase(
                 github=github,

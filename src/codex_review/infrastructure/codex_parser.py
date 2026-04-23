@@ -40,23 +40,24 @@ def parse_review(raw: str) -> ReviewResult:
 
     event = _parse_event(payload.get("event"))
     findings = tuple(_parse_findings(payload.get("comments")))
+    must_fix = tuple(_as_str_list(payload.get("must_fix")))
 
     # 모델 프롬프트에 `critical/major → REQUEST_CHANGES` 규칙을 명시했지만 LLM 이 가끔
-    # COMMENT 로 내려보낸다 (자기 확신 부족·프롬프트 경합). 차단 등급 계약을 코드 레벨에서
-    # 보장해 심각한 지적이 APPROVE/COMMENT 로 묻히지 않도록 강제 승격.
-    # APPROVE 는 그대로 둔다 — 모델이 "아무 이슈 없음" 을 단언한 상태에서 반례가 있으면
-    # 리뷰 결과 자체가 비일관이라 운영자가 볼 수 있도록 그대로 게시.
-    if (
-        event == ReviewEvent.COMMENT
-        and any(f.is_blocking for f in findings)
-    ):
+    # COMMENT 로 내려보낸다 (자기 확신 부족·프롬프트 경합). 차단 신호가 **어떤 형태로든**
+    # 있으면 이벤트를 승격해 병합 차단 효과를 살려야 한다.
+    #   1) 인라인 findings 에 critical/major 가 하나라도 있음 (is_blocking).
+    #   2) 파일/모듈 단위 `must_fix` 섹션에 항목이 있음 — 라인 고정이 애매해 인라인으로
+    #      못 달았을 뿐 "반드시 수정" 의도임. 프롬프트 규칙상 이 자체로 REQUEST_CHANGES.
+    # APPROVE 는 모순 상태를 그대로 노출하도록 두 경우 모두 덮어쓰지 않는다.
+    has_blocking_signal = any(f.is_blocking for f in findings) or bool(must_fix)
+    if event == ReviewEvent.COMMENT and has_blocking_signal:
         event = ReviewEvent.REQUEST_CHANGES
 
     return ReviewResult(
         summary=str(payload.get("summary", "")).strip() or "요약 없음",
         event=event,
         positives=tuple(_as_str_list(payload.get("positives"))),
-        must_fix=tuple(_as_str_list(payload.get("must_fix"))),
+        must_fix=must_fix,
         improvements=tuple(_as_str_list(payload.get("improvements"))),
         findings=findings,
     )

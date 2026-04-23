@@ -378,6 +378,30 @@ async def test_diff_collector_final_verify_is_noop_when_prompt_fits() -> None:
     assert dump.exceeded_budget is False
 
 
+async def test_diff_collector_final_verify_uses_append_then_sort_for_ordering() -> None:
+    """회귀 (gemini PR #17 Suggestion): `insert(0, ...)` 의 O(N²) 을 피하려고 루프 중엔
+    append 만 하고 종료 후 한 번에 정렬한다. 이 테스트는 결과 순서가 여전히 원본
+    `changed_files` 순서를 따르는지 직접 확인.
+    """
+    def fake_length(pr: PullRequest, dump: FileDump) -> int:
+        # 8 files 를 쓰는데 6개가 축출되도록 설정 — insert 패턴이면 O(N²) 가 눈에 띌 수 있음.
+        return 110 * len(dump.entries) + 20 * len(dump.budget_trimmed)
+
+    collector = DiffContextCollector(overhead_estimator=fake_length)
+    patches = {f"f{i}.py": "@@\n+x\n" for i in range(8)}
+    changed = tuple(f"f{i}.py" for i in range(8))
+    pr = _pr(changed=changed, patches=patches)
+
+    dump = await collector.collect_diff(pr, TokenBudget(max_tokens=100))
+
+    # budget_trimmed 는 changed_files 의 부분집합이며 원본 상대 순서를 유지.
+    original_index = {p: i for i, p in enumerate(changed)}
+    positions = [original_index[p] for p in dump.budget_trimmed]
+    assert positions == sorted(positions), (
+        f"budget_trimmed 순서가 원본을 벗어남: {dump.budget_trimmed}"
+    )
+
+
 async def test_diff_collector_final_verify_budget_trimmed_ordering_preserved() -> None:
     """verify 루프가 떨어뜨린 entries 는 `budget_trimmed` 앞쪽으로 삽입돼 원본 순서를 유지.
 

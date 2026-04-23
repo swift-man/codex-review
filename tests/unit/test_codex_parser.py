@@ -105,6 +105,25 @@ def test_parse_upgrades_comment_to_request_changes_when_blocking_finding_present
     assert parse_review(raw_major).event == ReviewEvent.REQUEST_CHANGES
 
 
+def test_parse_upgrades_comment_to_request_changes_when_must_fix_section_present() -> None:
+    """회귀 (codex PR #17 Major): 모델이 `must_fix` 섹션에 "반드시 수정" 항목을
+    넣고도 인라인 `comments` 에는 해당 라인을 특정 못해 안 넣는 경우가 있다. 이때도
+    이벤트는 REQUEST_CHANGES 로 승격돼야 병합 차단 신호가 살아난다.
+
+    이전 구현은 `findings.is_blocking` 만 봐서, `must_fix` 섹션만 있는 경우 COMMENT
+    로 새어 나갔음 — 리뷰어가 본문 안 보고 merge 해버릴 위험.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "must_fix": ["핵심 보안 결함 — 토큰 로깅 경로 확인 필요"],
+      "comments": []
+    }
+    """
+    assert parse_review(raw).event == ReviewEvent.REQUEST_CHANGES
+
+
 def test_parse_keeps_comment_event_when_only_minor_or_suggestion() -> None:
     """비차단 등급만 있을 때는 event 를 건드리지 않는다."""
     raw = """
