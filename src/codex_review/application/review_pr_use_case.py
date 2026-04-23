@@ -140,7 +140,10 @@ def _filter_findings_to_diff(
     """Drop findings whose (path, line) is not in the PR's RIGHT-side diff.
 
     diff 정보가 비어 있으면(fetch 실패나 테스트 더블) 보수적으로 전부 드롭한다.
-    드롭 건수는 로그로 남겨 튜닝/디버깅에 활용한다.
+    드롭 건수는 로그로 남기고, **드롭된 finding 은 `dropped_findings` 에 누적해 리뷰
+    본문에서 접이식 섹션으로 보존** 한다 (codex/gemini PR #17 지적 반영).
+    이렇게 하지 않으면 라인 번호가 어긋난 순간 지적 자체가 조용히 사라져 리뷰 품질
+    을 과대평가할 위험이 있다.
     """
     if not result.findings:
         return result
@@ -156,13 +159,19 @@ def _filter_findings_to_diff(
 
     if dropped:
         logger.info(
-            "%s#%d — dropped %d/%d inline finding(s) not on RIGHT-side diff",
+            "%s#%d — dropped %d/%d inline finding(s) not on RIGHT-side diff "
+            "(preserved in body as collapsible section)",
             repo_full_name,
             pr_number,
             len(dropped),
             len(result.findings),
         )
-        return replace(result, findings=tuple(kept))
+        return replace(
+            result,
+            findings=tuple(kept),
+            # 이전 단계에서 이미 dropped 된 항목(예: 422 재시도) 과 누적해야 한다.
+            dropped_findings=result.dropped_findings + tuple(dropped),
+        )
     return result
 
 

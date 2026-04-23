@@ -52,6 +52,32 @@ def test_render_body_without_findings_does_not_mention_inline_comments() -> None
     assert "기술 단위 코멘트" not in result.render_body()
 
 
+def test_render_body_without_dropped_findings_omits_collapsible_section() -> None:
+    """기본 경로 회귀: dropped_findings 가 비어 있으면 본문에 접이식 섹션이 없어야 한다."""
+    result = ReviewResult(summary="요약", event=ReviewEvent.COMMENT)
+    body = result.render_body()
+    assert "<details>" not in body
+    assert "인라인 게시에서 제외" not in body
+
+
+def test_render_body_with_dropped_findings_emits_collapsible_details() -> None:
+    """dropped_findings 가 있으면 접이식 `<details>` 섹션으로 라인·등급·원문을 보존."""
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+        dropped_findings=(
+            Finding(path="a.py", line=42, body="보존돼야 할 지적"),
+        ),
+    )
+    body = result.render_body()
+    assert "<details>" in body
+    assert "</details>" in body
+    assert "인라인 게시에서 제외된 지적 1건" in body
+    assert "`a.py:42`" in body
+    assert "보존돼야 할 지적" in body
+    assert "[Suggestion]" in body  # 기본 severity 라벨
+
+
 def test_render_body_does_not_include_model_footer() -> None:
     """Footer 는 인프라 계층(GitHubAppClient) 에서만 붙인다."""
     result = ReviewResult(summary="요약", event=ReviewEvent.COMMENT)

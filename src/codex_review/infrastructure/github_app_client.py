@@ -231,15 +231,20 @@ class GitHubAppClient:
         except httpx.HTTPStatusError as exc:
             # 방어선: use-case 단계의 diff 필터가 있음에도 422 가 나면 인라인 코멘트를 포기하고
             # 본문만 재게시한다. 리뷰 전체를 포기하는 것보다 낫다.
-            # 본문도 findings 제거된 상태로 재렌더해야 "기술 단위 코멘트 N건" 안내가 남는
-            # 거짓 상태를 피할 수 있다.
+            # 제거한 findings 는 **조용히 삭제하지 않고** `dropped_findings` 로 옮겨
+            # 본문 접이식 섹션으로 보존. 그래야 리뷰어가 "모델이 뭘 지적했었는지" 를
+            # 나중에라도 확인할 수 있다 (codex/gemini PR #17 지적 반영).
             if exc.response.status_code == 422 and payload["comments"]:
                 logger.warning(
-                    "422 on review POST for %s#%d; retrying without inline comments",
-                    pr.repo.full_name,
-                    pr.number,
+                    "422 on review POST for %s#%d; retrying without inline comments "
+                    "(%d finding(s) preserved in body)",
+                    pr.repo.full_name, pr.number, len(result.findings),
                 )
-                retry_result = replace(result, findings=())
+                retry_result = replace(
+                    result,
+                    findings=(),
+                    dropped_findings=result.dropped_findings + result.findings,
+                )
                 payload["body"] = _with_model_footer(
                     retry_result.render_body(), self._review_model_label
                 )

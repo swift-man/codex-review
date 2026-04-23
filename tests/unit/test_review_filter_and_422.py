@@ -130,6 +130,16 @@ async def test_use_case_drops_findings_outside_diff() -> None:
     assert len(github.posted) == 1
     _, posted = github.posted[0]
     assert [f.body for f in posted.findings] == ["kept"]
+    # 회귀 (codex/gemini PR #17): drop 된 3건은 조용히 사라지지 않고 dropped_findings
+    # 에 보존돼 render_body() 가 접이식 섹션으로 노출해야 한다.
+    dropped_bodies = {f.body for f in posted.dropped_findings}
+    assert dropped_bodies == {"invalid line", "unchanged file", "no diff for b.py"}
+    body = posted.render_body()
+    assert "인라인 게시에서 제외된 지적 3건" in body
+    assert "<details>" in body and "</details>" in body
+    # 라인·경로·원문이 모두 섹션에 있어 리뷰어가 찾아볼 수 있어야 한다.
+    assert "`a.py:99`" in body
+    assert "invalid line" in body
 
 
 async def test_use_case_drops_all_findings_when_diff_info_missing() -> None:
@@ -271,6 +281,41 @@ async def test_post_review_422_retry_also_rerenders_body_without_findings_notice
     assert "전체 요약" in retry_body
     assert "좋은 점 1" in retry_body
     assert "개선할 점 1" in retry_body
+
+
+async def test_post_review_422_retry_preserves_dropped_findings_in_body(
+    stubbed_github,
+) -> None:
+    """회귀 (codex/gemini PR #17): 422 재시도로 인라인이 포기돼도 모델이 낸 지적은
+    본문 `<details>` 섹션으로 보존돼야 한다. 조용히 사라지면 리뷰 품질을 과대평가.
+    """
+    make_client, posts = stubbed_github
+    client = make_client(responses=[422])
+
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+        findings=(
+            Finding(path="a.py", line=10, body="핵심 지적 A"),
+            Finding(path="b.py", line=5, body="핵심 지적 B"),
+        ),
+    )
+    pr = _pr(diff_right_lines={"a.py": frozenset({10}), "b.py": frozenset({5})})
+    await client.post_review(pr, result)
+
+    first_body = _body_of(posts[0])["body"]
+    retry_body = _body_of(posts[1])["body"]
+
+    # 1차 시도엔 인라인 안내가 있고 dropped 섹션은 없다.
+    assert "기술 단위 코멘트 2건" in first_body
+    assert "인라인 게시에서 제외된 지적" not in first_body
+    # 2차(재시도) 에서 findings 는 빠졌지만 두 지적이 접이식 섹션에 모두 남아야 한다.
+    assert "인라인 게시에서 제외된 지적 2건" in retry_body
+    assert "<details>" in retry_body
+    assert "핵심 지적 A" in retry_body
+    assert "핵심 지적 B" in retry_body
+    assert "`a.py:10`" in retry_body
+    assert "`b.py:5`" in retry_body
 
 
 async def test_post_review_reraises_non_422_http_errors(stubbed_github) -> None:
