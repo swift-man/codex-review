@@ -39,14 +39,20 @@ OverheadEstimator = PromptLengthEstimator
 
 
 def _default_prompt_length(pr: PullRequest, dump: FileDump) -> int:
-    """실 운영 기본값 — `build_prompt()` 를 호출해 그 길이를 측정.
+    """실 운영 기본값 — `build_prompt()` 결과의 **UTF-8 바이트 길이** 를 반환.
+
+    char 수가 아니라 바이트 수를 쓰는 이유: 한글·이모지 같은 멀티바이트 문자가 많은
+    patch 에서는 char 수가 실제 stdin 입력량을 과소평가한다 (예: 한글 1자 = 3 bytes).
+    `TokenBudget.max_chars()` 에 대한 비교는 수치적으로 "bytes 가 chars 보다 같거나 큼"
+    이라 더 **보수적**인 방향으로만 틀어져, 예산 초과를 회피하는 fallback 의 원래
+    목적에 부합한다 (codex PR #17 Major 지적 반영).
 
     collector 는 이 함수를 두 번 쓴다:
       (1) 초기 오버헤드 산정 — 빈 덤프 기준
       (2) 최종 검증 — 실제 담은 entries + SCOPE 섹션 포함한 전체 프롬프트
     테스트는 `lambda pr, dump: 0` 같은 stub 을 주입해 두 경로 모두 중립화할 수 있다.
     """
-    return len(build_prompt(pr, dump))
+    return len(build_prompt(pr, dump).encode("utf-8"))
 
 
 def _build_dump(
@@ -55,10 +61,14 @@ def _build_dump(
     patch_missing: tuple[str, ...],
     budget: TokenBudget | None,
 ) -> FileDump:
-    """중간 상태에서 최종 FileDump 를 재구성하는 헬퍼 (최종 검증 루프용)."""
+    """중간 상태에서 최종 FileDump 를 재구성하는 헬퍼 (최종 검증 루프용).
+
+    `total_chars` 는 FileDump 필드명 호환을 위해 이름은 유지하지만, diff 모드에서는
+    실제로 UTF-8 바이트 수를 담는다 (`FileEntry.size_bytes` 와 단위 통일).
+    """
     return FileDump(
         entries=tuple(entries),
-        total_chars=sum(len(e.content) for e in entries),
+        total_chars=sum(e.size_bytes for e in entries),
         excluded=tuple(budget_trimmed) + patch_missing,
         exceeded_budget=bool(budget_trimmed),
         budget=budget,
@@ -81,7 +91,10 @@ class DiffContextCollector:
         self._prompt_length = overhead_estimator or _default_prompt_length
 
     async def collect_diff(self, pr: PullRequest, budget: TokenBudget) -> FileDump:
-        max_chars = budget.max_chars()
+        # `TokenBudget.max_chars()` 는 이름상 char 기준이지만, 실 운영에서 더 보수적인
+        # UTF-8 바이트 기준으로 비교한다 (한글/이모지 많은 patch 의 CJK 과소평가 방어).
+        # `_default_prompt_length` 가 bytes 를 반환하므로 같은 단위로 비교.
+        budget_units = budget.max_chars()
         # 1st pass: patch 없는 파일을 먼저 분류한다. SCOPE 섹션에 들어가므로 오버헤드
         # 계산에도 정확히 반영돼야 한다.
         patch_missing = tuple(p for p in pr.changed_files if p not in pr.diff_patches)
@@ -97,11 +110,11 @@ class DiffContextCollector:
             mode=DUMP_MODE_DIFF,
             budget=budget,
         )
-        overhead_chars = self._prompt_length(pr, overhead_estimate_dump)
+        overhead_bytes = self._prompt_length(pr, overhead_estimate_dump)
         # 오버헤드가 예산 전체를 삼킨 경우 정직하게 0 반환. use case 가 "빈 덤프" 로
         # 판정해 fallback 불가 안내로 떨어지게 한다. 인위적 floor 로 "사실상 초과" 상태
         # 를 숨기면 codex 단계에서 더 혼란스러운 실패로 이어진다.
-        patch_budget = max(0, max_chars - overhead_chars)
+        patch_budget = max(0, budget_units - overhead_bytes)
 
         # Early return: 오버헤드만으로 예산이 다 소진됐다면 patch 파일 순회해도 전부
         # budget_trimmed 처리만 하게 된다. 불필요한 반복을 생략하고 같은 결과를 즉시
@@ -109,9 +122,9 @@ class DiffContextCollector:
         # 으로 기록해 리뷰 본문/프롬프트 SCOPE 에 정확히 노출.
         if patch_budget <= 0:
             logger.warning(
-                "diff collector: overhead %d chars already exceeds budget %d — "
+                "diff collector: overhead %d bytes already exceeds budget %d — "
                 "skipping file loop, marking all patched changed files as budget-trimmed",
-                overhead_chars, max_chars,
+                overhead_bytes, budget_units,
             )
             all_trimmed = tuple(p for p in pr.changed_files if p in pr.diff_patches)
             return FileDump(
@@ -126,7 +139,7 @@ class DiffContextCollector:
 
         entries: list[FileEntry] = []
         budget_trimmed: list[str] = []
-        total_chars = 0
+        total_bytes = 0
         budget_full = False  # early return 이후 경로이므로 예산은 양수 보장.
 
         for path in pr.changed_files:
@@ -143,39 +156,42 @@ class DiffContextCollector:
 
             # `@@ -... +... @@` hunk 가 이미 파일 경로를 포함하지 않는다. LLM 이 어떤
             # 파일의 변경인지 알 수 있도록 얇은 파일 헤더를 붙여 내보낸다.
+            # 예산 누적·비교·`FileEntry.size_bytes` 모두 동일한 UTF-8 바이트 길이를
+            # 사용해 단위를 통일 (codex PR #17 Major 지적).
             body = f"=== PATCH: {path} ===\n{patch.rstrip()}\n"
-            size_chars = len(body)
             size_bytes = len(body.encode("utf-8"))
 
-            if total_chars + size_chars > patch_budget:
+            if total_bytes + size_bytes > patch_budget:
                 budget_trimmed.append(path)
                 budget_full = True
                 logger.warning(
-                    "diff collector: patch budget exceeded after %d entries (%d/%d chars, "
+                    "diff collector: patch budget exceeded after %d entries (%d/%d bytes, "
                     "overhead=%d) — dropping %s and subsequent changed files",
-                    len(entries), total_chars, patch_budget, overhead_chars, path,
+                    len(entries), total_bytes, patch_budget, overhead_bytes, path,
                 )
                 continue
 
             entries.append(
                 FileEntry(path=path, content=body, size_bytes=size_bytes, is_changed=True)
             )
-            total_chars += size_chars
+            total_bytes += size_bytes
 
+        # `FileDump.total_chars` 필드명은 역사적 호환을 위해 유지하지만, diff 모드에서는
+        # 실제로 UTF-8 바이트 수가 담긴다 (_build_dump 가 entries.size_bytes 를 합산).
         dump = _build_dump(entries, budget_trimmed, patch_missing, budget)
 
         # 4th pass — **최종 검증**: 오버헤드 산정은 budget_trimmed SCOPE 섹션이 아직
         # 비어 있는 상태로 했다. 이제 그 목록이 생겼으므로 실제 `build_prompt()` 길이를
-        # 한 번 더 측정해서 `max_chars` 를 넘으면 뒤에서부터 entries 를 떨어뜨린다.
+        # 한 번 더 측정해서 예산을 넘으면 뒤에서부터 entries 를 떨어뜨린다.
         # 떨어진 entry 는 budget_trimmed 쪽으로 옮겨져 SCOPE 섹션에 추가되지만,
         # 그 추가 overhead 까지 포함해 re-check 하므로 단조 감소 → 반드시 수렴한다
         # (codex PR #17 Major 지적 반영).
-        dump = self._enforce_final_prompt_budget(pr, dump, max_chars)
+        dump = self._enforce_final_prompt_budget(pr, dump, budget_units)
 
         logger.info(
             "diff collector: files=%d total_chars=%d (patch_budget=%d, overhead=%d) "
             "budget_trimmed=%d patch_missing=%d",
-            len(dump.entries), dump.total_chars, patch_budget, overhead_chars,
+            len(dump.entries), dump.total_chars, patch_budget, overhead_bytes,
             len(dump.budget_trimmed), len(dump.patch_missing),
         )
         return dump

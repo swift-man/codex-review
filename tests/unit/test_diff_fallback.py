@@ -479,6 +479,54 @@ async def test_default_overhead_estimator_measures_real_build_prompt() -> None:
     assert dump.exceeded_budget is False
 
 
+async def test_diff_collector_budget_uses_utf8_bytes_for_cjk_patches() -> None:
+    """회귀 (codex PR #17 Major): 예산 비교가 char 수 기준이면 한글/이모지 등 멀티바이트
+    patch 에서 실제 stdin 바이트가 추정보다 커져 codex exec 한도 초과 위험. 단위는
+    **UTF-8 바이트** 로 통일돼야 하고 `FileEntry.size_bytes` 와도 일치.
+
+    시나리오: patch 가 모두 ASCII 인 세트와 동일한 구조를 한글로 채운 세트를 같은
+    예산으로 수집하면, **한글 세트가 바이트 수로 예산을 더 빨리 소진** (= 더 적게
+    담김) 해야 한다. 이전 char 기반 비교에서는 두 경우가 같게 보였다.
+    """
+    def zero_overhead(pr: PullRequest, empty_dump: FileDump) -> int:
+        return 0
+
+    collector = DiffContextCollector(overhead_estimator=zero_overhead)
+
+    # ASCII: 각 patch 는 대략 50 bytes (body + header).
+    ascii_patches = {
+        f"a{i}.py": "@@ -1 +1 @@\n-old\n+new\n" for i in range(10)
+    }
+    ascii_pr = _pr(
+        changed=tuple(f"a{i}.py" for i in range(10)), patches=ascii_patches
+    )
+
+    # 한글: 같은 라인 수, 한글은 UTF-8 에서 1자 = 3 bytes → 약 3배 큼.
+    korean_patches = {
+        f"a{i}.py": "@@ -1 +1 @@\n-이전값\n+새로운값\n" for i in range(10)
+    }
+    korean_pr = _pr(
+        changed=tuple(f"a{i}.py" for i in range(10)), patches=korean_patches
+    )
+
+    # 예산 300 bytes — ASCII 는 여러 파일 담기지만 한글은 훨씬 적게 담겨야 한다.
+    budget = TokenBudget(max_tokens=75)  # = 300 bytes
+
+    ascii_dump = await collector.collect_diff(ascii_pr, budget)
+    korean_dump = await collector.collect_diff(korean_pr, budget)
+
+    # ASCII 는 더 많이 담긴다 — 예산이 바이트 기준이라 멀티바이트가 더 빨리 소진.
+    assert len(ascii_dump.entries) > len(korean_dump.entries), (
+        f"예산 단위가 char 였다면 두 세트가 비슷해야 하지만, UTF-8 bytes 기준이면 "
+        f"한글이 적게 담긴다. ASCII={len(ascii_dump.entries)}, "
+        f"Korean={len(korean_dump.entries)}"
+    )
+    # size_bytes 가 실제 바이트와 일치하고, total_chars (실은 bytes) 도 그 합과 일치.
+    for entry in korean_dump.entries:
+        assert entry.size_bytes == len(entry.content.encode("utf-8"))
+    assert korean_dump.total_chars == sum(e.size_bytes for e in korean_dump.entries)
+
+
 async def test_diff_collector_size_bytes_uses_utf8_byte_length() -> None:
     """회귀 (gemini PR #17 Major): 한글 등 멀티바이트가 섞이면 `len(body)` (char 개수)
     와 `len(body.encode('utf-8'))` (bytes) 가 크게 달라진다. FileEntry.size_bytes 는
@@ -601,7 +649,9 @@ async def test_use_case_falls_back_to_diff_when_full_exceeds_and_changed_missing
         # b.py 는 filter 가 아닌 예산 컷이므로 filter_excluded 는 비어 있다.
     )
     engine_result = ReviewResult(summary="OK", event=ReviewEvent.COMMENT)
-    uc, engine = _use_case(github, exceeded_full, engine_result)
+    # 실 `build_prompt` overhead 가 ~4KB (시스템 규칙 + PR meta) 라 patch 를 담으려면
+    # 넉넉한 예산이 필요. 10K tokens (=40KB) 면 system rules + 작은 patch 둘 다 fit.
+    uc, engine = _use_case(github, exceeded_full, engine_result, max_tokens=10_000)
 
     patches = {
         "a.py": "@@ -1,1 +1,2 @@\n x = 1\n+y = 2\n",
