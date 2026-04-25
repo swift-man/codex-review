@@ -168,3 +168,46 @@ async def test_review_logs_full_stderr_and_raises_concise_summary(
     assert "model 'gpt-5.5' not available" in full_log
     assert "rc=1" in full_log
     assert "model=gpt-5.5" in full_log
+
+
+async def test_review_masks_credentials_in_review_engine_error_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """회귀 (codex PR #18 Critical): stderr 마지막 줄에 토큰 URL 이 있으면
+    `ReviewEngineError` 메시지에도 마스킹된 형태로만 들어가야 한다.
+    이 메시지는 logger.exception traceback 이나 PR 진단 코멘트로 흘러가는데, 현재
+    `_RedactFilter` 는 traceback 안의 exc 문자열을 재마스킹하지 않으므로 **예외 생성
+    시점에 직접 마스킹** 해야 누출 표면이 막힌다.
+    """
+    from codex_review.domain import FileDump, FileEntry, PullRequest, RepoRef
+    from codex_review.interfaces import ReviewEngineError
+
+    stderr = (
+        b"OpenAI Codex v0.124.0\n"
+        b"--------\n"
+        b"fatal: unable to access 'https://x-access-token:ghs_LEAKED@github.com/o/r.git'\n"
+    )
+    _patch_subprocess(monkeypatch, _FakeProc(1, stdout=b"", stderr=stderr))
+
+    pr = PullRequest(
+        repo=RepoRef("o", "r"), number=1, title="t", body="",
+        head_sha="abc", head_ref="feat", base_sha="def", base_ref="main",
+        clone_url="https://example/x.git", changed_files=("a.py",),
+        installation_id=7, is_draft=False,
+    )
+    dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1,
+    )
+
+    eng = CodexCliEngine(binary="codex", model="gpt-5.5")
+    with pytest.raises(ReviewEngineError) as exc_info:
+        await eng.review(pr, dump)
+
+    msg = str(exc_info.value)
+    # 토큰은 절대 메시지에 들어가면 안 된다.
+    assert "ghs_LEAKED" not in msg
+    # URL 자격증명은 마스킹된 형태로 표시.
+    assert "https://***@github.com" in msg
+    # returncode 정보는 유지 (도메인 메타데이터).
+    assert exc_info.value.returncode == 1

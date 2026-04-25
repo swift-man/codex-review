@@ -18,16 +18,24 @@ _URL_USERINFO_PATTERN = re.compile(
 )
 
 
-def _redact_text(text: str) -> str:
+def redact_text(text: str) -> str:
     """문자열 안의 두 종류 시크릿(URL userinfo, 평문 key=value) 을 모두 마스킹.
 
     URL 패턴을 **먼저** 적용 — `https://x-access-token:xxx@host` 형태에선 URL 의 일부
     로서 `token:xxx` 가 등장하므로, SECRET 패턴이 먼저 동작하면 URL 구조가 깨져
     URL 마스킹이 더 이상 안 먹는다. 순서: URL → SECRET 이 안전한 조합.
+
+    공개 헬퍼: 로그 외에도 PR 코멘트·예외 메시지 등 **사용자에게 노출되는 다른 경로**
+    (예: `logger.exception` 의 traceback 안의 exc 문자열, GitHub PR 본문 게시) 에서도
+    사용한다 — 단일 진실의 마스킹 룰을 공유해야 누락 표면이 안 생김 (codex PR #18 Critical).
     """
     text = _URL_USERINFO_PATTERN.sub(r"\g<scheme>://***@", text)
     text = _SECRET_PATTERN.sub(r"\1=***", text)
     return text
+
+
+# 내부 호환용 alias — 기존 `_redact_text` 호출자도 그대로 동작.
+_redact_text = redact_text
 
 
 def _redact_arg(value: Any) -> Any:

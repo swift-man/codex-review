@@ -18,6 +18,7 @@ from codex_review.interfaces import (
     ReviewEngine,
     ReviewEngineError,
 )
+from codex_review.logging_utils import redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +271,17 @@ def _prepend_diff_scope_badge(result: ReviewResult, dump: FileDump) -> ReviewRes
     return replace(result, summary="\n".join(lines) + result.summary)
 
 
+def _make_code_fence_safe(text: str) -> str:
+    """입력 안의 ``` 시퀀스를 zero-width-space 로 분리해 markdown 코드펜스 깨짐 방어.
+
+    PR 진단 코멘트는 detail 을 ``` … ``` 코드펜스에 감싸 게시하는데, detail 자체에
+    ``` 가 있으면 GitHub 마크다운이 fence 를 그 위치에서 닫아 본문 나머지가 깨진다.
+    각 백틱 사이에 U+200B(zero-width space) 를 끼워 시각적으로는 거의 같지만 fence
+    파서엔 더 이상 ``` 로 인식되지 않게 만든다.
+    """
+    return text.replace("```", "`\u200b`\u200b`")
+
+
 def _engine_failure_message(
     pr: PullRequest,
     dump: FileDump,
@@ -284,11 +296,20 @@ def _engine_failure_message(
 
     PR 에 아무 메시지도 안 달리는 "조용한 실패" 를 막는 것이 목적 — 운영자가
     무엇이 잘못됐는지 즉시 인지할 수 있도록 모드/모델/원인을 노출한다.
+
+    보안 고려:
+      - `str(exc)` 는 stderr 마지막 줄을 포함할 수 있어 토큰 URL / 인증 헤더가
+        섞일 위험이 있다. 엔진 단에서 마스킹했더라도 다른 ReviewEngine 구현에서
+        새 누출 표면이 생길 수 있으므로 **본문 게시 직전 한 번 더 redact_text**
+        를 적용 (defense-in-depth, codex PR #18 Critical+Major 반영).
+      - 코드펜스 안에 백틱 3개가 들어 있으면 ``` 가 풀려 본문 전체 markdown 이
+        깨진다. detail 의 백틱을 zero-width-space 로 분리해 fence 깨짐 방어
+        (codex PR #18 Suggestion 반영).
     """
-    # 예외 메시지를 1KB 로 제한해 본문이 폭주하지 않도록.
-    detail = str(exc)
+    detail = redact_text(str(exc))
     if len(detail) > 1000:
         detail = detail[:1000] + "…"
+    detail = _make_code_fence_safe(detail)
 
     mode_desc = "diff-only 모드까지 재시도" if attempted_diff else "full 모드만 시도"
     advice = (

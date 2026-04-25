@@ -1010,6 +1010,107 @@ async def test_use_case_propagates_non_engine_errors_without_fallback() -> None:
     assert github.posted_reviews == []
 
 
+async def test_diagnostic_comment_masks_credentials_in_exception_message() -> None:
+    """회귀 (codex PR #18 Critical+Major): 진단 PR 코멘트가 `str(exc)` 를 그대로 본문에
+    넣으면, 엔진이 마스킹하지 못한 이상값(다른 ReviewEngine 구현·향후 변경) 에서 토큰
+    URL 이 PR 대화에 누출될 수 있다. **본문 게시 직전 한 번 더 redact_text** 를 적용해
+    defense-in-depth 를 구현해야 한다.
+    """
+    from codex_review.interfaces import ReviewEngineError
+
+    github = _CapturingGitHub()
+    full_ok_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1,
+        mode=DUMP_MODE_FULL,
+    )
+
+    @dataclass
+    class _LeakingEngine:
+        seen_dumps: list[FileDump] = field(default_factory=list)
+
+        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+            self.seen_dumps.append(dump)
+            # 엔진이 마스킹 안 한 채로 토큰 URL 이 들어간 메시지를 raise — 다른 엔진
+            # 구현/향후 변경에서 발생할 수 있는 시나리오.
+            raise ReviewEngineError(
+                "engine failure: https://x-access-token:ghs_RAW@github.com/o/r.git",
+                returncode=1,
+            )
+
+    engine = _LeakingEngine()
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_ok_dump),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=10_000,
+        diff_context_collector=None,  # diff 시도 막아 진단 코멘트 경로로 직행
+    )
+    pr = _pr(changed=("a.py",), patches={"a.py": "@@\n+x\n"})
+
+    await uc.execute(pr)
+
+    # 진단 코멘트가 게시됐고, 본문에 raw 토큰이 절대 없어야 한다.
+    assert len(github.posted_comments) == 1
+    _, body = github.posted_comments[0]
+    assert "ghs_RAW" not in body
+    # 마스킹된 URL 형태로 등장.
+    assert "https://***@github.com" in body
+
+
+async def test_diagnostic_comment_escapes_triple_backtick_in_exception() -> None:
+    """회귀 (codex PR #18 Suggestion): exception detail 에 백틱 3개가 들어 있으면
+    detail 을 감싸는 ``` 코드펜스가 그 위치에서 닫혀 본문 markdown 이 깨진다.
+    백틱 사이에 zero-width space 를 끼워 fence 가 끝까지 유지되도록 한다.
+    """
+    from codex_review.interfaces import ReviewEngineError
+
+    github = _CapturingGitHub()
+    full_ok_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1,
+        mode=DUMP_MODE_FULL,
+    )
+
+    @dataclass
+    class _BacktickEngine:
+        seen_dumps: list[FileDump] = field(default_factory=list)
+
+        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+            self.seen_dumps.append(dump)
+            # 백틱 3개가 포함된 메시지 — 코드펜스 깨짐 유발 시도
+            raise ReviewEngineError(
+                "engine output: ```python\nbad\n``` finished",
+                returncode=1,
+            )
+
+    engine = _BacktickEngine()
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_ok_dump),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=10_000,
+        diff_context_collector=None,
+    )
+    pr = _pr(changed=("a.py",), patches={"a.py": "@@\n+x\n"})
+
+    await uc.execute(pr)
+
+    _, body = github.posted_comments[0]
+    # detail 안에 raw ``` 가 있으면 본문의 첫 ``` 직후에 fence 가 닫혀 본문이 깨진다.
+    # detail 영역 외에도 본문 마무리에 ``` 가 있어야 함을 확인.
+    # detail 안의 ``` 는 zero-width-space 가 끼어 더 이상 ``` 가 아니어야 한다.
+    # body 의 ``` 시퀀스 등장 횟수: 시작 펜스 + 종료 펜스 = 정확히 2회.
+    assert body.count("```") == 2, (
+        f"코드펜스가 깨졌거나 detail 내부 백틱이 escape 안 됨. body=\n{body}"
+    )
+    # 원본 텍스트 자체는 시각적으로 보존돼야 함 (zero-width space 제외 시).
+    assert "engine output" in body
+    assert "finished" in body
+
+
 async def test_use_case_does_not_recurse_when_failing_in_diff_mode() -> None:
     """이미 diff 모드 dump 가 들어왔는데 엔진이 실패하면 재귀 호출 없이 즉시 진단.
 

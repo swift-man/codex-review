@@ -3,6 +3,7 @@ import logging
 
 from codex_review.domain import FileDump, PullRequest, ReviewResult
 from codex_review.interfaces import ReviewEngineError
+from codex_review.logging_utils import redact_text
 
 from ._subprocess import kill_and_reap
 from .codex_parser import parse_review
@@ -127,7 +128,13 @@ class CodexCliEngine:
             # diff fallback 결정을 정확히 내릴 수 있게 (gemini PR #18 Major+Suggestion 반영).
             # 메시지엔 stderr 의 **마지막 줄** 만 포함 — 보통 Codex CLI 가 마지막 줄에
             # 실제 원인(model not available, context length exceeded 등) 을 찍는다.
-            summary = err.splitlines()[-1] if err else "(no stderr)"
+            #
+            # 보안: 예외 메시지는 이후 `logger.exception` 의 traceback 이나 PR 진단
+            # 코멘트 본문으로도 흘러간다. `_RedactFilter` 는 traceback 안의 exc 문자열은
+            # 마스킹하지 않으므로, **예외에 넣기 전 단계에서 직접 마스킹** 해야 토큰 URL /
+            # `authorization=Bearer ...` 같은 자격증명이 어떤 경로로도 새지 않는다
+            # (codex PR #18 Critical 반영).
+            summary = redact_text(err.splitlines()[-1]) if err else "(no stderr)"
             raise ReviewEngineError(
                 f"codex exec failed (rc={proc.returncode}, model={self._model}): {summary}",
                 returncode=proc.returncode,
