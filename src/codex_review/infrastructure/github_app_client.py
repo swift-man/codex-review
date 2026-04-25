@@ -12,7 +12,14 @@ import certifi
 import httpx
 import jwt
 
-from codex_review.domain import Finding, PullRequest, RepoRef, ReviewEvent, ReviewResult
+from codex_review.domain import (
+    Finding,
+    PullRequest,
+    RepoRef,
+    ReviewEvent,
+    ReviewResult,
+    ReviewThread,
+)
 
 from .diff_parser import parse_right_lines
 
@@ -262,6 +269,119 @@ class GitHubAppClient:
         path = f"/repos/{pr.repo.full_name}/issues/{pr.number}/comments"
         await self._request("POST", path, auth=f"token {token}", body={"body": body})
 
+    # --- Follow-up support (Phase 1) -----------------------------------------
+
+    async def list_review_threads(
+        self, pr: PullRequest, installation_id: int
+    ) -> tuple[ReviewThread, ...]:
+        """GraphQL 로 PR review thread 와 각 root comment 를 한 번에 조회.
+
+        Phase 1 의 follow-up 판정에 필요한 모든 메타(스레드 ID, isResolved, root 댓글
+        databaseId/저자/path/line/commit/body, 사람·다른 봇 답글 존재 여부, 우리가 이미
+        단 follow-up 답글 마커 존재 여부) 를 한 query 로 가져온다.
+
+        페이지네이션은 1차 페이지 (100 thread × 50 comment) 만 보고, 그 이상은 운영
+        경고 로그 남기고 무시 — 한 PR 에 100개 이상 review thread 가 쌓이는 건 비정상.
+        """
+        token = await self.get_installation_token(installation_id)
+        query = """
+        query($owner:String!, $name:String!, $number:Int!) {
+          repository(owner:$owner, name:$name) {
+            pullRequest(number:$number) {
+              reviewThreads(first:100) {
+                pageInfo { hasNextPage }
+                nodes {
+                  id
+                  isResolved
+                  comments(first:50) {
+                    nodes {
+                      databaseId
+                      author { login }
+                      path
+                      line
+                      body
+                      commit { oid }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        variables = {
+            "owner": pr.repo.owner,
+            "name": pr.repo.name,
+            "number": pr.number,
+        }
+        data = await self._graphql(query, variables, auth=f"token {token}")
+        repo = (data.get("data") or {}).get("repository") or {}
+        prn = repo.get("pullRequest") or {}
+        threads_node = prn.get("reviewThreads") or {}
+        if (threads_node.get("pageInfo") or {}).get("hasNextPage"):
+            logger.warning(
+                "%s#%d has >100 review threads — follow-up will only consider the first page",
+                pr.repo.full_name, pr.number,
+            )
+
+        out: list[ReviewThread] = []
+        for raw in threads_node.get("nodes") or []:
+            thread = _parse_review_thread(raw)
+            if thread is not None:
+                out.append(thread)
+        return tuple(out)
+
+    async def reply_to_review_comment(
+        self, pr: PullRequest, comment_id: int, body: str
+    ) -> None:
+        """REST `POST /pulls/{n}/comments/{id}/replies` — 같은 스레드 내 답글로 묶인다."""
+        if self._dry_run:
+            logger.info(
+                "DRY_RUN — follow-up reply not posted: %s#%d comment=%d",
+                pr.repo.full_name, pr.number, comment_id,
+            )
+            return
+        token = await self.get_installation_token(pr.installation_id)
+        path = (
+            f"/repos/{pr.repo.full_name}/pulls/{pr.number}/comments/"
+            f"{comment_id}/replies"
+        )
+        await self._request("POST", path, auth=f"token {token}", body={"body": body})
+
+    async def resolve_review_thread(
+        self, thread_id: str, installation_id: int
+    ) -> None:
+        """GraphQL `resolveReviewThread` mutation — 스레드 closed 처리."""
+        if self._dry_run:
+            logger.info("DRY_RUN — thread not resolved: %s", thread_id)
+            return
+        token = await self.get_installation_token(installation_id)
+        mutation = """
+        mutation($threadId:ID!) {
+          resolveReviewThread(input:{threadId:$threadId}) {
+            thread { id isResolved }
+          }
+        }
+        """
+        await self._graphql(mutation, {"threadId": thread_id}, auth=f"token {token}")
+
+    async def _graphql(
+        self, query: str, variables: dict[str, Any], *, auth: str
+    ) -> dict[str, Any]:
+        """GitHub GraphQL v4 endpoint 호출. REST 와 다른 path (`/graphql`) 사용."""
+        body = {"query": query, "variables": variables}
+        resp = await self._send("POST", "/graphql", auth=auth, body=body)
+        data: Any = resp.json() if resp.content else {}
+        if not isinstance(data, dict):
+            return {}
+        # GraphQL 은 `errors` 배열로 부분 실패를 알린다 — HTTP 200 이어도 errors 가 있으면
+        # 경고로 기록 (mutation 의 thread already resolved 같은 케이스에서 발생 가능).
+        if data.get("errors"):
+            logger.warning(
+                "GitHub GraphQL returned errors: %s", data.get("errors"),
+            )
+        return data
+
     # --- HTTP ---------------------------------------------------------------
 
     async def _send(
@@ -329,4 +449,51 @@ def _finding_to_comment(f: Finding) -> dict[str, object]:
     return {"path": f.path, "line": f.line, "side": "RIGHT", "body": body}
 
 
-__all__ = ["GitHubAppClient", "ReviewEvent", "_default_tls_context"]
+# Follow-up 답글 본문에 박는 숨은 마커. 우리가 같은 스레드에 두 번 답글을 다는
+# 사고를 막기 위한 멱등성 표지. HTML 주석이라 GitHub UI 에선 보이지 않는다.
+FOLLOWUP_MARKER = "<!-- codex-review-followup:v1 -->"
+
+
+def _parse_review_thread(raw: dict[str, Any]) -> ReviewThread | None:
+    """GraphQL reviewThread 노드 → 도메인 `ReviewThread`. 필수 필드 누락 시 None."""
+    comments = ((raw.get("comments") or {}).get("nodes") or [])
+    if not comments:
+        return None
+    root = comments[0]
+    db_id = root.get("databaseId")
+    if not isinstance(db_id, int):
+        return None
+    root_author = ((root.get("author") or {}).get("login")) or ""
+    root_body = root.get("body") or ""
+    commit_id = ((root.get("commit") or {}).get("oid")) or ""
+    path = root.get("path") or ""
+    raw_line = root.get("line")
+    line = raw_line if isinstance(raw_line, int) else None
+
+    # 같은 스레드에 우리가 이미 follow-up 답글을 단 적이 있는지(멱등성) +
+    # 사람/다른 봇이 답글을 단 적이 있는지(인간 신호 존중) 모두 root 이후 comments 에서 본다.
+    has_followup_marker = False
+    has_other_author = False
+    for c in comments[1:]:
+        body = c.get("body") or ""
+        author = ((c.get("author") or {}).get("login")) or ""
+        if FOLLOWUP_MARKER in body and author == root_author:
+            has_followup_marker = True
+        if author and author != root_author:
+            has_other_author = True
+
+    return ReviewThread(
+        id=str(raw.get("id") or ""),
+        is_resolved=bool(raw.get("isResolved")),
+        root_comment_id=db_id,
+        root_author_login=root_author,
+        path=path,
+        line=line,
+        commit_id=commit_id,
+        body=root_body,
+        has_non_root_author_reply=has_other_author,
+        has_followup_marker=has_followup_marker,
+    )
+
+
+__all__ = ["FOLLOWUP_MARKER", "GitHubAppClient", "ReviewEvent", "_default_tls_context"]

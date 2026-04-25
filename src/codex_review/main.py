@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Response
 
+from codex_review.application.follow_up_use_case import FollowUpReviewUseCase
 from codex_review.application.review_pr_use_case import ReviewPullRequestUseCase
 from codex_review.application.webhook_handler import WebhookHandler
 from codex_review.config import Settings
@@ -77,12 +78,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 max_input_tokens=settings.codex_max_input_tokens,
                 diff_context_collector=diff_collector,
             )
+
+            # Phase 1 follow-up — `GITHUB_APP_SLUG` 가 설정된 경우에만 활성화. 슬러그를
+            # 알아야 우리 봇이 단 코멘트를 정확히 식별할 수 있어 옵트인 설계.
+            follow_up_use_case: FollowUpReviewUseCase | None = None
+            if settings.github_app_slug:
+                follow_up_use_case = FollowUpReviewUseCase(
+                    github=github,
+                    repo_fetcher=repo_fetcher,
+                    bot_user_login=f"{settings.github_app_slug}[bot]",
+                )
+                logger.info(
+                    "follow-up enabled for bot login: %s[bot]", settings.github_app_slug,
+                )
+            else:
+                logger.info(
+                    "follow-up disabled (set GITHUB_APP_SLUG to enable Phase 1 auto-resolution)"
+                )
+
             handler = WebhookHandler(
                 secret=settings.github_webhook_secret,
                 github=github,
                 use_case=use_case,
                 concurrency=settings.review_concurrency,
                 queue_maxsize=settings.review_queue_maxsize,
+                follow_up_use_case=follow_up_use_case,
             )
             # 요청 핸들러가 handler 를 찾을 수 있게 app state 에 보관.
             app.state.handler = handler
