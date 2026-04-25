@@ -26,6 +26,7 @@ _ALL_ALIASES = (
     "GITHUB_APP_PRIVATE_KEY",
     "GITHUB_WEBHOOK_SECRET",
     "GITHUB_API_BASE",
+    "GITHUB_APP_SLUG",
     "CODEX_BIN",
     "CODEX_MODEL",
     "CODEX_REASONING_EFFORT",
@@ -158,6 +159,17 @@ def test_enable_diff_fallback_can_be_disabled_via_env(
     """운영자가 품질 보장 우선 정책으로 fallback 을 옵트아웃 가능해야 한다."""
     s = _settings(monkeypatch, CODEX_ENABLE_DIFF_FALLBACK="false")
     assert s.enable_diff_fallback is False
+
+
+def test_github_app_slug_default_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """기본값 None 이면 follow-up 기능 자체 비활성화 (옵트인 설계)."""
+    s = _settings(monkeypatch)
+    assert s.github_app_slug is None
+
+
+def test_github_app_slug_can_be_set_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = _settings(monkeypatch, GITHUB_APP_SLUG="codex-review-bot")
+    assert s.github_app_slug == "codex-review-bot"
 
 
 def test_webhook_secret_whitespace_is_stripped_when_valid(

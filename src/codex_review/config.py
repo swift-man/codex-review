@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     github_app_private_key: str | None = Field(default=None, alias="GITHUB_APP_PRIVATE_KEY")
     github_webhook_secret: NonBlankStr = Field(..., alias="GITHUB_WEBHOOK_SECRET")
     github_api_base: str = Field(default="https://api.github.com", alias="GITHUB_API_BASE")
+    # PR 댓글 follow-up 기능 활성화에 필요한 봇 슬러그 (예: "codex-review-bot").
+    # GitHub 가 게시한 본인 댓글의 `user.login` 은 `f"{slug}[bot]"` 형태이므로, 이 값으로
+    # 우리 봇이 단 코멘트만 골라 follow-up 한다. 미설정 (None) 이면 follow-up 기능 자체
+    # 비활성화 — 운영자가 슬러그를 알고 명시적으로 옵트인 해야 작동한다.
+    github_app_slug: str | None = Field(default=None, alias="GITHUB_APP_SLUG")
 
     # Codex CLI — 음수/0 타임아웃이나 토큰 한도는 리뷰를 즉시 실패시키므로 `gt=0` 로 고정.
     codex_bin: str = Field(default="codex", alias="CODEX_BIN")

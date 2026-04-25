@@ -2,6 +2,7 @@ from .file_dump import DUMP_MODE_DIFF, DUMP_MODE_FULL, FileDump, FileEntry, Toke
 from .finding import Finding, ReviewEvent
 from .pull_request import PullRequest, RepoRef
 from .review_result import ReviewResult
+from .review_thread import ReviewThread
 
 __all__ = [
     "DUMP_MODE_DIFF",
@@ -13,5 +14,6 @@ __all__ = [
     "RepoRef",
     "ReviewEvent",
     "ReviewResult",
+    "ReviewThread",
     "TokenBudget",
 ]
