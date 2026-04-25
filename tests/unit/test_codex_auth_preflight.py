@@ -108,3 +108,63 @@ async def test_verify_auth_kills_subprocess_on_cancellation(
         await _engine().verify_auth()
 
     assert events == ["kill", "wait"], "취소 시 kill → wait 순으로 정리돼야 한다"
+
+
+# ---------------------------------------------------------------------------
+# review() error logging contract — full stderr to logger, concise summary in exception
+# ---------------------------------------------------------------------------
+
+
+async def test_review_logs_full_stderr_and_raises_concise_summary(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """회귀 (운영 사고): 이전 구현은 stderr 를 RuntimeError 메시지에 통째로 박아
+    traceback summary 가 첫 줄(=Codex 시작 배너)만 보여 진단을 못 하게 했다.
+    이제는 stderr 전체를 별도 ERROR 로그에, RuntimeError 에는 마지막 줄만.
+    """
+    import logging as _logging
+
+    from codex_review.domain import FileDump, FileEntry, PullRequest, RepoRef
+
+    multi_line_stderr = (
+        b"OpenAI Codex v0.124.0-alpha.2 (research preview)\n"
+        b"--------\n"
+        b"workdir: /tmp\n"
+        b"model: gpt-5.5\n"
+        b"--------\n"
+        b"Error: model 'gpt-5.5' not available in this account\n"
+    )
+    _patch_subprocess(monkeypatch, _FakeProc(1, stdout=b"", stderr=multi_line_stderr))
+
+    pr = PullRequest(
+        repo=RepoRef("o", "r"), number=1, title="t", body="",
+        head_sha="abc", head_ref="feat", base_sha="def", base_ref="main",
+        clone_url="https://example/x.git", changed_files=("a.py",),
+        installation_id=7, is_draft=False,
+    )
+    dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x=1", size_bytes=3, is_changed=True),),
+        total_chars=3,
+    )
+
+    eng = CodexCliEngine(binary="codex", model="gpt-5.5")
+
+    with caplog.at_level(
+        _logging.ERROR, logger="codex_review.infrastructure.codex_cli_engine"
+    ):
+        with pytest.raises(RuntimeError) as exc_info:
+            await eng.review(pr, dump)
+
+    # (1) RuntimeError 메시지엔 stderr 의 **마지막 줄** + 모델명이 포함돼 진단 가능.
+    msg = str(exc_info.value)
+    assert "gpt-5.5" in msg
+    assert "model 'gpt-5.5' not available" in msg
+    # 시작 배너는 메시지에 없음 (이전엔 첫 줄로 잘려 진단 어려웠음).
+    assert "research preview" not in msg
+
+    # (2) ERROR 로그에는 multi-line stderr 전체가 보존됨.
+    full_log = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "research preview" in full_log
+    assert "model 'gpt-5.5' not available" in full_log
+    assert "rc=1" in full_log
+    assert "model=gpt-5.5" in full_log

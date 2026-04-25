@@ -58,10 +58,10 @@ class ReviewPullRequestUseCase:
 
         # 이 지점 이후 파일 I/O 없음 — dump 는 메모리에 담긴 스냅샷. 락을 풀어도 안전.
 
+        # ── 1차 fallback: PRE-EMPTIVE (사전 예산 계산 기반) ────────────────
         # 변경 파일이 **예산 때문에** 잘려 나갔다면 전체-코드베이스 리뷰가 성립하지 않는다.
         # 단 바이너리/정책 필터로 제외된 변경 파일(예: .png) 은 fallback 을 트리거하면 안 된다
-        # (gemini PR #17 Major 지적). 의미상 "diff 에서 봐도 못 보는 파일" 이라 fallback 해봐야
-        # 품질만 떨어진다.
+        # — 의미상 "diff 에서 봐도 못 보는 파일" 이라 fallback 해봐야 품질만 떨어진다.
         if dump.exceeded_budget and _changed_trimmed_by_budget(pr, dump):
             fallback_dump = await self._try_diff_fallback(pr)
             if fallback_dump is None:
@@ -78,19 +78,85 @@ class ReviewPullRequestUseCase:
             pr.repo.full_name, pr.number, dump.mode,
             len(dump.entries), dump.total_chars, len(dump.excluded),
         )
-        result = await self._engine.review(pr, dump)
+
+        # ── 2차 fallback: REACTIVE (엔진 실패 기반) ───────────────────────
+        # 우리 예산 추정(`max_tokens × 4 chars`)은 모델의 실제 토큰 한도와 다를 수 있다.
+        # 특히 한글 등 멀티바이트 코드베이스에서는 우리가 "fit" 으로 판정해도 모델이 입력
+        # 거부 → `codex exec` 가 returncode 1 로 실패. 이때 봇이 그대로 죽으면 PR 에 아무
+        # 메시지도 안 달려 운영 가시성이 크게 떨어진다. 따라서 **full 모드에서 엔진이
+        # 실패하면 자동으로 diff 모드로 재시도** 해 가용성을 보장한다.
+        result = await self._review_with_fallback(pr, dump)
+        if result is None:
+            return  # 진단 코멘트 게시 후 정리 종료
 
         # 모델이 제안한 인라인 코멘트를 PR diff 의 RIGHT-side 라인 집합과 교차해 걸러낸다.
         # (변경되지 않은 파일/줄에 코멘트를 달면 GitHub 가 422 로 리뷰 전체를 거부한다.)
         # 걸러진 항목은 본문 렌더링에도 반영되도록 ReviewResult 자체를 새로 만든다.
         result = _filter_findings_to_diff(result, pr.diff_right_lines, pr.repo.full_name, pr.number)
 
+        await self._github.post_review(pr, result)
+
+    async def _review_with_fallback(
+        self, pr: PullRequest, dump: FileDump
+    ) -> ReviewResult | None:
+        """엔진 호출을 시도하고, full 모드 실패 시 diff 모드로 재시도. 둘 다 실패하면
+        PR 에 진단 코멘트를 게시하고 None 반환 — 호출자가 종료하도록 한다.
+
+        반환값:
+          - 성공한 `ReviewResult` (full 또는 diff 모드, 배지 prepend 포함)
+          - 모든 시도 실패 시 None (이미 진단 코멘트 게시 완료)
+        """
+        try:
+            result = await self._engine.review(pr, dump)
+        except Exception as exc:
+            # 이미 diff 모드인데 또 실패 → 더 줄일 수 없다. 진단 코멘트 + 종료.
+            if dump.mode == DUMP_MODE_DIFF:
+                logger.exception(
+                    "engine failed in diff-only mode for %s#%d — no further fallback",
+                    pr.repo.full_name, pr.number,
+                )
+                await self._github.post_comment(
+                    pr, _engine_failure_message(pr, dump, exc, attempted_diff=True)
+                )
+                return None
+
+            # full 모드 실패 — 모델이 입력 거부했을 가능성 높다. diff 모드로 재시도.
+            logger.warning(
+                "engine failed on full mode for %s#%d (%s) — retrying in diff-only mode",
+                pr.repo.full_name, pr.number, type(exc).__name__,
+            )
+            fallback_dump = await self._try_diff_fallback(pr)
+            if fallback_dump is None:
+                # diff fallback 자체가 불가 — patch 없거나 운영자가 옵트아웃.
+                logger.exception(
+                    "engine failed and diff fallback unavailable for %s#%d",
+                    pr.repo.full_name, pr.number,
+                )
+                await self._github.post_comment(
+                    pr, _engine_failure_message(pr, dump, exc, attempted_diff=False)
+                )
+                return None
+            try:
+                result = await self._engine.review(pr, fallback_dump)
+            except Exception as retry_exc:
+                logger.exception(
+                    "engine retry in diff mode also failed for %s#%d",
+                    pr.repo.full_name, pr.number,
+                )
+                await self._github.post_comment(
+                    pr,
+                    _engine_failure_message(
+                        pr, fallback_dump, retry_exc, attempted_diff=True
+                    ),
+                )
+                return None
+            dump = fallback_dump  # 이후 배지 결정 용
+
         # diff-only 모드로 수행된 리뷰는 본문 상단에 배지를 달아, 리뷰어가 "왜 전체
-        # 코드베이스 지적이 얕은지" 를 바로 인지하도록 한다. 모델이 아닌 infra 가 덧붙임.
+        # 코드베이스 지적이 얕은지" 를 바로 인지하도록 한다.
         if dump.mode == DUMP_MODE_DIFF:
             result = _prepend_diff_scope_badge(result, dump)
-
-        await self._github.post_review(pr, result)
+        return result
 
     async def _try_diff_fallback(self, pr: PullRequest) -> FileDump | None:
         """diff-only 모드로 fallback 가능 여부를 판단해 성공 시 새 dump 를 반환."""
@@ -197,6 +263,51 @@ def _prepend_diff_scope_badge(result: ReviewResult, dump: FileDump) -> ReviewRes
         "",
     ]
     return replace(result, summary="\n".join(lines) + result.summary)
+
+
+def _engine_failure_message(
+    pr: PullRequest,
+    dump: FileDump,
+    exc: BaseException,
+    *,
+    attempted_diff: bool,
+) -> str:
+    """엔진 호출이 모두 실패했을 때 PR 에 게시할 진단 코멘트.
+
+    `attempted_diff` 가 True 면 full→diff 재시도까지 둘 다 실패한 상황. False 면
+    diff fallback 이 아예 불가능해서 시도조차 안 한 상황 (patch 없음·옵트아웃 등).
+
+    PR 에 아무 메시지도 안 달리는 "조용한 실패" 를 막는 것이 목적 — 운영자가
+    무엇이 잘못됐는지 즉시 인지할 수 있도록 모드/모델/원인을 노출한다.
+    """
+    # 예외 메시지를 1KB 로 제한해 본문이 폭주하지 않도록.
+    detail = str(exc)
+    if len(detail) > 1000:
+        detail = detail[:1000] + "…"
+
+    mode_desc = "diff-only 모드까지 재시도" if attempted_diff else "full 모드만 시도"
+    advice = (
+        "1. `CODEX_MAX_INPUT_TOKENS` 를 모델 실제 윈도우보다 작게 조정 "
+        "(예: 150000) → 큰 PR 은 자동 diff 모드로 떨어집니다.\n"
+        "2. 더 큰 컨텍스트 윈도우의 모델로 `CODEX_MODEL` 변경.\n"
+        "3. 서버 로그(stderr 전체) 를 확인해 모델/CLI 측 메시지 검증.\n"
+    )
+    if not attempted_diff:
+        advice += (
+            "4. `CODEX_ENABLE_DIFF_FALLBACK=true` 확인 또는 GitHub 가 patch 를 반환했는지 "
+            "확인 (큰 PR / binary 변경만으로 구성된 경우 patch 누락 가능).\n"
+        )
+
+    return (
+        "⚠️ **Codex Review — 리뷰 엔진 실패**\n\n"
+        f"이 PR 은 자동 리뷰를 완료하지 못했습니다 ({mode_desc}).\n\n"
+        f"- 마지막 시도 모드: `{dump.mode}`\n"
+        f"- 컨텍스트 파일 수: {len(dump.entries)}\n"
+        f"- 실패 원인:\n"
+        f"```\n{detail}\n```\n\n"
+        "**조치 제안**\n"
+        f"{advice}"
+    )
 
 
 def _budget_exceeded_message(pr: PullRequest, dump: FileDump) -> str:

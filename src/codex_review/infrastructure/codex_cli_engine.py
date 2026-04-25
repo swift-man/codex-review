@@ -110,8 +110,19 @@ class CodexCliEngine:
 
         if proc.returncode != 0:
             err = stderr.decode(errors="replace").strip()
+            # 전체 stderr 는 별도 ERROR 로그로 — multi-line 그대로 보존되어 운영 진단이
+            # 즉시 가능하다. 이전엔 stderr 가 RuntimeError 메시지에 들어가 traceback
+            # summary 가 첫 줄(=Codex 시작 배너) 만 보여 진단에 시간이 걸렸다.
+            logger.error(
+                "codex exec failed (rc=%d, model=%s):\n%s",
+                proc.returncode, self._model, err or "(no stderr)",
+            )
+            # RuntimeError 메시지엔 stderr 의 **마지막 줄** 만 포함 — 보통 Codex CLI 가
+            # 마지막 줄에 실제 원인 (예: model not available, context length exceeded) 을
+            # 찍는다. traceback 첫 줄에 즉시 노출돼 가시성 ↑.
+            summary = err.splitlines()[-1] if err else "(no stderr)"
             raise RuntimeError(
-                f"codex exec failed ({proc.returncode}): {err[:1000]}"
+                f"codex exec failed (rc={proc.returncode}, model={self._model}): {summary}"
             )
 
         return parse_review(stdout.decode(errors="replace"))
