@@ -810,6 +810,343 @@ async def test_use_case_still_falls_back_when_source_change_was_budget_trimmed()
     assert engine.seen_dumps[0].mode == DUMP_MODE_DIFF
 
 
+@dataclass
+class _FailingEngine:
+    """첫 호출에서 ReviewEngineError → 두 번째(diff dump 일 때) 호출에서 성공.
+    엔진이 입력을 거부하는 시나리오 (예: 모델 컨텍스트 윈도우 초과) 모사.
+
+    `ReviewEngineError` 를 사용하는 이유 (gemini PR #18 Major): use case 가 일반
+    `Exception` 이 아니라 도메인 엔진 예외만 잡도록 좁혔으므로 fake 도 동일 계약을
+    따라야 한다. 일반 RuntimeError 는 더 이상 fallback 트리거가 아니다.
+    """
+    second_result: ReviewResult
+    full_error_msg: str = "codex exec failed (rc=1, model=gpt-5.5): context length exceeded"
+    seen_dumps: list[FileDump] = field(default_factory=list)
+
+    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        from codex_review.interfaces import ReviewEngineError
+
+        self.seen_dumps.append(dump)
+        if dump.mode == DUMP_MODE_FULL:
+            raise ReviewEngineError(self.full_error_msg, returncode=1)
+        return self.second_result
+
+
+@dataclass
+class _AlwaysFailingEngine:
+    """어떤 모드든 실패 — 진단 코멘트 경로 검증용."""
+    error_msg: str = "codex exec failed (rc=1): something deeply broken"
+    seen_dumps: list[FileDump] = field(default_factory=list)
+
+    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        from codex_review.interfaces import ReviewEngineError
+
+        self.seen_dumps.append(dump)
+        raise ReviewEngineError(self.error_msg, returncode=1)
+
+
+async def test_use_case_falls_back_to_diff_when_engine_rejects_full_input() -> None:
+    """핵심 회귀 (실 운영 사고): 우리 예산 추정은 fit 으로 판정했지만 모델이 실제
+    토큰 한도로 입력을 거부하는 경우, 봇이 그대로 죽지 않고 diff 모드로 자동 재시도.
+
+    시나리오:
+      - PR 변경 파일이 정상적으로 full dump 에 포함됨 (exceeded_budget=False)
+      - 하지만 실제 codex exec 호출 시 모델이 returncode 1 로 거부
+      - 사전 예산 fallback 은 트리거 안 됨 (조건 불충족)
+      - 반응형 fallback 이 RuntimeError 잡아 diff dump 로 재시도 → 성공
+    """
+    github = _CapturingGitHub()
+    # full dump 는 정상 — 예산 안 넘음.
+    full_ok_dump = FileDump(
+        entries=(
+            FileEntry(path="a.py", content="x=1\n", size_bytes=4, is_changed=True),
+        ),
+        total_chars=4,
+        mode=DUMP_MODE_FULL,
+    )
+    second_result = ReviewResult(summary="diff 모드 결과", event=ReviewEvent.COMMENT)
+    engine = _FailingEngine(second_result=second_result)
+
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_ok_dump),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=10_000,
+        diff_context_collector=DiffContextCollector(overhead_estimator=_zero_overhead),
+    )
+
+    patches = {"a.py": "@@ -1,1 +1,1 @@\n-x=1\n+x=2\n"}
+    pr = _pr(changed=("a.py",), patches=patches, diff_right={"a.py": frozenset({1})})
+
+    await uc.execute(pr)
+
+    # 엔진 두 번 호출됨 (full → diff)
+    assert len(engine.seen_dumps) == 2
+    assert engine.seen_dumps[0].mode == DUMP_MODE_FULL
+    assert engine.seen_dumps[1].mode == DUMP_MODE_DIFF
+
+    # 리뷰가 정상 게시됨 — 봇이 죽지 않음
+    assert len(github.posted_reviews) == 1
+    assert github.posted_comments == []  # 진단 코멘트 X — 정상 복구
+    _, posted = github.posted_reviews[0]
+    # diff 모드 배지가 본문에 prepend
+    assert "diff-only" in posted.summary
+
+
+async def test_use_case_posts_diagnostic_when_both_modes_fail() -> None:
+    """diff fallback 까지 실패 → PR 에 진단 코멘트 게시 (조용한 실패 방지).
+
+    이전엔 봇이 RuntimeError 그대로 raise 해서 PR 에 아무것도 안 달리고 운영자가
+    서버 로그를 직접 뒤져야 했음. 이제는 진단 정보가 PR 본문에 그대로 노출.
+    """
+    github = _CapturingGitHub()
+    full_ok_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x=1", size_bytes=3, is_changed=True),),
+        total_chars=3,
+        mode=DUMP_MODE_FULL,
+    )
+    engine = _AlwaysFailingEngine(error_msg="codex exec failed: model not available")
+
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_ok_dump),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=10_000,
+        diff_context_collector=DiffContextCollector(overhead_estimator=_zero_overhead),
+    )
+    patches = {"a.py": "@@ -1 +1 @@\n-x\n+y\n"}
+    pr = _pr(changed=("a.py",), patches=patches)
+
+    await uc.execute(pr)
+
+    # 두 번 시도 (full + diff) 후 모두 실패
+    assert len(engine.seen_dumps) == 2
+    # 리뷰는 게시되지 않음
+    assert github.posted_reviews == []
+    # 그러나 PR 에 **진단 코멘트** 가 달림 — 운영자가 즉시 인지 가능
+    assert len(github.posted_comments) == 1
+    _, comment_body = github.posted_comments[0]
+    assert "리뷰 엔진 실패" in comment_body
+    assert "model not available" in comment_body
+    assert "diff-only 모드까지 재시도" in comment_body
+
+
+async def test_use_case_posts_diagnostic_when_diff_fallback_unavailable() -> None:
+    """엔진 실패 + diff fallback 자체가 불가능(patch 없음/옵트아웃) — 진단 코멘트 게시."""
+    github = _CapturingGitHub()
+    full_ok_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1,
+        mode=DUMP_MODE_FULL,
+    )
+    engine = _AlwaysFailingEngine(error_msg="some engine error")
+
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_ok_dump),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=10_000,
+        diff_context_collector=None,  # opt-out
+    )
+    pr = _pr(changed=("a.py",), patches={"a.py": "@@\n+x\n"})
+
+    await uc.execute(pr)
+
+    # 엔진은 1회만 호출 (diff 시도 자체가 안 일어남)
+    assert len(engine.seen_dumps) == 1
+    assert github.posted_reviews == []
+    assert len(github.posted_comments) == 1
+    _, body = github.posted_comments[0]
+    assert "리뷰 엔진 실패" in body
+    assert "full 모드만 시도" in body  # diff 시도 안 됐음을 명시
+    assert "CODEX_ENABLE_DIFF_FALLBACK" in body  # 운영자에게 옵트아웃 확인 안내
+
+
+async def test_use_case_propagates_non_engine_errors_without_fallback() -> None:
+    """회귀 (gemini PR #18 Major): 엔진의 ReviewEngineError 가 아닌 예외(KeyError,
+    TypeError, MemoryError 등 진짜 코드 버그) 는 catch 하지 않고 그대로 전파한다.
+
+    이전 `except Exception` 은 너무 광범위해 무관한 런타임 버그까지 삼키고 잘못된
+    diff fallback 을 유발했다 — 진짜 원인이 가려지고 운영자가 한참 후에야 발견.
+    """
+    github = _CapturingGitHub()
+    full_ok_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1,
+        mode=DUMP_MODE_FULL,
+    )
+
+    @dataclass
+    class _BuggyEngine:
+        seen_dumps: list[FileDump] = field(default_factory=list)
+
+        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+            self.seen_dumps.append(dump)
+            # 의도적으로 무관한 버그 (엔진 입력 거부가 아님)
+            raise KeyError("config_section")
+
+    engine = _BuggyEngine()
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_ok_dump),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=10_000,
+        diff_context_collector=DiffContextCollector(overhead_estimator=_zero_overhead),
+    )
+    pr = _pr(changed=("a.py",), patches={"a.py": "@@\n+x\n"})
+
+    # 진짜 버그는 그대로 propagate — diff fallback 으로 가려지지 않아야 한다.
+    with pytest.raises(KeyError):
+        await uc.execute(pr)
+
+    # 엔진은 1회만 호출됨 — 재시도 시도조차 안 됨.
+    assert len(engine.seen_dumps) == 1
+    # 진단 코멘트도 없음 — 엔진 입력 문제가 아니므로 운영자에게 다른 종류의 신호.
+    assert github.posted_comments == []
+    assert github.posted_reviews == []
+
+
+async def test_diagnostic_comment_masks_credentials_in_exception_message() -> None:
+    """회귀 (codex PR #18 Critical+Major): 진단 PR 코멘트가 `str(exc)` 를 그대로 본문에
+    넣으면, 엔진이 마스킹하지 못한 이상값(다른 ReviewEngine 구현·향후 변경) 에서 토큰
+    URL 이 PR 대화에 누출될 수 있다. **본문 게시 직전 한 번 더 redact_text** 를 적용해
+    defense-in-depth 를 구현해야 한다.
+    """
+    from codex_review.interfaces import ReviewEngineError
+
+    github = _CapturingGitHub()
+    full_ok_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1,
+        mode=DUMP_MODE_FULL,
+    )
+
+    @dataclass
+    class _LeakingEngine:
+        seen_dumps: list[FileDump] = field(default_factory=list)
+
+        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+            self.seen_dumps.append(dump)
+            # 엔진이 마스킹 안 한 채로 토큰 URL 이 들어간 메시지를 raise — 다른 엔진
+            # 구현/향후 변경에서 발생할 수 있는 시나리오.
+            raise ReviewEngineError(
+                "engine failure: https://x-access-token:ghs_RAW@github.com/o/r.git",
+                returncode=1,
+            )
+
+    engine = _LeakingEngine()
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_ok_dump),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=10_000,
+        diff_context_collector=None,  # diff 시도 막아 진단 코멘트 경로로 직행
+    )
+    pr = _pr(changed=("a.py",), patches={"a.py": "@@\n+x\n"})
+
+    await uc.execute(pr)
+
+    # 진단 코멘트가 게시됐고, 본문에 raw 토큰이 절대 없어야 한다.
+    assert len(github.posted_comments) == 1
+    _, body = github.posted_comments[0]
+    assert "ghs_RAW" not in body
+    # 마스킹된 URL 형태로 등장.
+    assert "https://***@github.com" in body
+
+
+async def test_diagnostic_comment_escapes_triple_backtick_in_exception() -> None:
+    """회귀 (codex PR #18 Suggestion): exception detail 에 백틱 3개가 들어 있으면
+    detail 을 감싸는 ``` 코드펜스가 그 위치에서 닫혀 본문 markdown 이 깨진다.
+    백틱 사이에 zero-width space 를 끼워 fence 가 끝까지 유지되도록 한다.
+    """
+    from codex_review.interfaces import ReviewEngineError
+
+    github = _CapturingGitHub()
+    full_ok_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1,
+        mode=DUMP_MODE_FULL,
+    )
+
+    @dataclass
+    class _BacktickEngine:
+        seen_dumps: list[FileDump] = field(default_factory=list)
+
+        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+            self.seen_dumps.append(dump)
+            # 백틱 3개가 포함된 메시지 — 코드펜스 깨짐 유발 시도
+            raise ReviewEngineError(
+                "engine output: ```python\nbad\n``` finished",
+                returncode=1,
+            )
+
+    engine = _BacktickEngine()
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_ok_dump),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=10_000,
+        diff_context_collector=None,
+    )
+    pr = _pr(changed=("a.py",), patches={"a.py": "@@\n+x\n"})
+
+    await uc.execute(pr)
+
+    _, body = github.posted_comments[0]
+    # detail 안에 raw ``` 가 있으면 본문의 첫 ``` 직후에 fence 가 닫혀 본문이 깨진다.
+    # detail 영역 외에도 본문 마무리에 ``` 가 있어야 함을 확인.
+    # detail 안의 ``` 는 zero-width-space 가 끼어 더 이상 ``` 가 아니어야 한다.
+    # body 의 ``` 시퀀스 등장 횟수: 시작 펜스 + 종료 펜스 = 정확히 2회.
+    assert body.count("```") == 2, (
+        f"코드펜스가 깨졌거나 detail 내부 백틱이 escape 안 됨. body=\n{body}"
+    )
+    # 원본 텍스트 자체는 시각적으로 보존돼야 함 (zero-width space 제외 시).
+    assert "engine output" in body
+    assert "finished" in body
+
+
+async def test_use_case_does_not_recurse_when_failing_in_diff_mode() -> None:
+    """이미 diff 모드 dump 가 들어왔는데 엔진이 실패하면 재귀 호출 없이 즉시 진단.
+
+    1차 fallback (사전 예산 기반) 으로 이미 diff 가 됐을 때, 또 엔진이 실패하면
+    더 줄일 수 있는 범위가 없으므로 무한 재시도하지 않고 바로 진단 코멘트로 종료.
+    """
+    github = _CapturingGitHub()
+    # 사전 예산 fallback 을 트리거할 dump (변경 파일이 budget_trimmed 됨)
+    exceeded_full = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("a.py",),
+        exceeded_budget=True,
+        mode=DUMP_MODE_FULL,
+    )
+    engine = _AlwaysFailingEngine()
+
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=exceeded_full),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=10_000,
+        diff_context_collector=DiffContextCollector(overhead_estimator=_zero_overhead),
+    )
+    pr = _pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"})
+
+    await uc.execute(pr)
+
+    # 엔진은 1회만 (diff 모드에서). 재귀 안 됨.
+    assert len(engine.seen_dumps) == 1
+    assert engine.seen_dumps[0].mode == DUMP_MODE_DIFF
+    # 진단 코멘트 게시
+    assert len(github.posted_comments) == 1
+
+
 async def test_use_case_fallback_empty_result_goes_to_budget_notice() -> None:
     """변경 파일이 전부 `patch_missing` 이라 diff dump 가 비면 fallback 이 의미 없다 —
     안내 코멘트 경로로 떨어져야 한다.
