@@ -62,6 +62,21 @@ GitHub Pull Request 의 **전체 코드베이스**를 한국어로 리뷰한다.
 - `improvements` = **권장 개선**. 리팩터·테스트 보강·성능 힌트 등.
 - `comments` = **라인 고정 기술 단위 코멘트**. 각 항목의 `severity` 는 아래 4단계 중 하나만 허용한다. **4단계 이외의 값 (예: "must_fix", "suggest", "nit", "blocker") 을 쓰지 마라.**
 
+## comments[].body 형식 (반드시 지켜라)
+
+`body` 는 **사람이 읽는 한국어 자연어 평문**이다. 다음을 절대 하지 마라:
+
+- `body` 안에 또 다른 JSON 오브젝트 / Python dict 를 박지 마라. 즉 `body: "{'severity': 'major', 'message': '...'}"` 같이 dict 의 문자열 표현을 본문으로 보내면 PR 에 그 raw 문자열이 그대로 노출된다.
+- `body` 안에 `severity:` / `message:` / `path:` 같은 key-value 헤더를 넣지 마라. severity 와 path 는 outer 스키마가 이미 들고 있다 — 본문에서 중복하면 노이즈만 늘어난다.
+- 코드펜스(```) 자체는 허용하지만 **펜스 안에 다시 JSON/dict 를 reasoning trace 로 dump 하지 마라**. 모델 내부 표현이 그대로 새어 나가는 신호다.
+
+올바른 `body` 예시:
+- `"문제 → ... 영향 → ... 제안 → ... (코드 스니펫은 ```python ... ``` 으로 감싼다)"`
+
+잘못된 `body` 예시 (실제로 발생한 버그 패턴):
+- `"{'severity': 'major', 'message': '...정규식 경계 제거로...'}"` — dict repr 그대로 누출.
+- `"severity=major, message=..."` — key=value 헤더 누출.
+
 ## 라인 코멘트 등급 기준 (severity)
 
 `severity` 는 반드시 아래 네 값 중 하나. PR 화면에서 각 코멘트 본문 맨 앞에 `[Critical]` / `[Major]` / `[Minor]` / `[Suggestion]` 형태로 자동 삽입된다.
@@ -163,6 +178,14 @@ DIFF_MODE_SYSTEM_RULES = """\
 - `suggestion` — 대안 · 취향 · 리팩터링 제안.
 
 취향·스타일로 논쟁 여지가 있으면 `suggestion` 으로 낮춘다.
+
+## comments[].body 형식 (반드시 지켜라)
+
+`body` 는 사람이 읽는 한국어 자연어 평문. `body` 안에 또 다른 JSON 오브젝트나
+Python dict (`{'severity': 'major', 'message': '...'}`) 를 박지 마라 — outer 스키마가
+이미 severity / path / line 을 들고 있으므로 본문 안에 같은 key 를 다시 넣으면
+PR 에 raw dict 문자열이 그대로 노출된다. 코드 스니펫은 펜스(```) 로 감싸되 펜스
+안에 reasoning trace 의 JSON dump 를 넣지 마라.
 
 ## diff 해석 가이드
 

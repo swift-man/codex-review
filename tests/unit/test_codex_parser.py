@@ -255,3 +255,105 @@ def test_parse_drops_findings_without_valid_line() -> None:
     paths = [f.path for f in result.findings]
     assert paths == ["src/d.py"]
     assert result.findings[0].line == 5
+
+
+# ---------------------------------------------------------------------------
+# body 정화 — 모델이 dict repr 을 박는 실 운영 사고 회귀
+# ---------------------------------------------------------------------------
+
+
+def test_parse_unwraps_python_dict_repr_in_body_into_message() -> None:
+    """회귀(실 운영 사고): 모델이 가끔 `body` 안에 또 한 번 Python dict repr 을 박아
+    `{'severity': 'major', 'message': '...'}` 라는 raw 문자열이 PR 인라인 코멘트에
+    그대로 노출되는 사례. 본문에서 message 만 추출해 자연어로 보이게 정화한다.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "src/a.py", "line": 7, "severity": "major",
+         "body": "{'severity': 'major', 'message': '거래어 감지 정규식에서 경계를 완전히 제거하면서 감사요/회사요 같은 일반 문장도 거래 안내를 발사할 수 있습니다.'}"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert len(result.findings) == 1
+    f = result.findings[0]
+    assert f.body.startswith("거래어 감지 정규식")
+    # raw dict 형태가 본문에 새지 않는다.
+    assert "'severity'" not in f.body
+    assert "'message'" not in f.body
+
+
+def test_parse_unwraps_json_dict_with_message_key() -> None:
+    """JSON 형식(쌍따옴표) 으로 박힌 dict 도 동일하게 unwrap."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "minor",
+         "body": "{\\"severity\\": \\"minor\\", \\"message\\": \\"네이밍이 일관되지 않습니다.\\"}"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body == "네이밍이 일관되지 않습니다."
+
+
+def test_parse_preserves_inline_dict_quote_in_plain_prose() -> None:
+    """평문 본문 안에 짧은 dict 가 인용된 케이스는 unwrap 시도하지 않는다 (false
+    positive 방지). 정화는 body 전체가 dict literal 모양일 때만 적용.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "suggestion",
+         "body": "이 옵션은 `{'a': 1}` 처럼 dict 형태로 넘기는 게 직관적입니다."}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    body = result.findings[0].body
+    # 원문이 그대로 보존돼야 한다.
+    assert "{'a': 1}" in body
+    assert "직관적입니다" in body
+
+
+def test_parse_falls_back_when_dict_lacks_message_key() -> None:
+    """dict 인데 message 류 키가 없으면 raw 를 코드펜스로 감싸 noise 최소화 + 경고 안내."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "minor",
+         "body": "{'severity': 'minor', 'foo': 'bar'}"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    body = result.findings[0].body
+    assert "추출에 실패" in body
+    assert "```" in body  # 코드펜스로 감싸 시각 노이즈 최소화
+
+
+def test_parse_keeps_body_unchanged_when_not_dict_shape() -> None:
+    """일반 평문 + 코드펜스 포함 본문은 절대 건드리지 않는다 — happy path 보존."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "major",
+         "body": "문제: ... 영향: ... 제안: ```python\\nuse Path\\n```"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    body = result.findings[0].body
+    assert body.startswith("문제:")
+    assert "```python" in body

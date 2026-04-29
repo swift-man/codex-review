@@ -621,9 +621,13 @@ def _use_case(
     github: _CapturingGitHub,
     full_dump: FileDump,
     engine_result: ReviewResult,
-    max_tokens: int = 1000,
+    max_tokens: int = 2000,
     with_diff_collector: bool = True,
 ) -> tuple[ReviewPullRequestUseCase, _CapturingEngine]:
+    # 기본 max_tokens 는 prompt overhead (build_prompt 결과 길이) 가 새 프롬프트 룰
+    # 추가로 ~4400 bytes 까지 늘어났음을 고려해 1000 → 2000 으로 상향. 이전 1000
+    # (=4000 chars) 은 overhead 만으로도 가득 차 diff fallback 자체가 못 돌아갔다.
+    # 개별 테스트는 시나리오별로 max_tokens 를 명시 override (e.g. 10_000 또는 100).
     engine = _CapturingEngine(result=engine_result)
     uc = ReviewPullRequestUseCase(
         github=github,
