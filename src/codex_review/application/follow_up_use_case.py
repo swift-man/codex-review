@@ -108,6 +108,7 @@ class FollowUpReviewUseCase:
         #    limit (~30 mut/min) 에 걸리지 않도록 `Semaphore` 로 동시성 상한. 한 thread
         #    실패가 다른 thread 처리를 막지 않도록 `return_exceptions=True`.
         sem = asyncio.Semaphore(_FOLLOWUP_API_CONCURRENCY)
+        thread_ids = [thread.id for thread, _ in actions]
         results = await asyncio.gather(
             *(
                 self._apply_action_with_limit(sem, pr, thread, action)
@@ -115,7 +116,18 @@ class FollowUpReviewUseCase:
             ),
             return_exceptions=True,
         )
-        failures = sum(1 for r in results if isinstance(r, Exception))
+        # 실패는 개수만 합산하지 말고 thread.id 와 traceback 을 같이 남긴다
+        # (gemini PR #19 Major). 운영 환경에서 GraphQL rate limit / network 오류 등의
+        # 원인을 추적하려면 어떤 thread 가 어떤 예외로 실패했는지 알아야 한다.
+        failures = 0
+        for thread_id, result in zip(thread_ids, results, strict=True):
+            if isinstance(result, BaseException):
+                failures += 1
+                logger.warning(
+                    "follow-up: thread %s failed on %s#%d",
+                    thread_id, pr.repo.full_name, pr.number,
+                    exc_info=result,
+                )
         if failures:
             logger.warning(
                 "follow-up: %d/%d thread(s) failed during reply/resolve on %s#%d",

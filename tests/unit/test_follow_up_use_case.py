@@ -265,12 +265,17 @@ async def test_processes_each_candidate_independently(tmp_path: Path) -> None:
     assert sorted(github.resolved_ids) == ["T_1", "T_2"]
 
 
-async def test_continues_processing_when_one_thread_reply_fails(tmp_path: Path) -> None:
+async def test_continues_processing_when_one_thread_reply_fails(
+    tmp_path: Path, caplog
+) -> None:
     """한 스레드 reply 실패가 다른 스레드 처리를 막지 않는다.
 
     회귀 (gemini + coderabbitai PR #19 Major): 액션 순서가 **resolve 먼저 → reply** 라
     reply 실패 시 마커가 안 박히고 thread 만 닫힌다. 다음 push 에서 thread 가 이미
     `is_resolved=True` 라 자연스럽게 후보 제외 — stuck state 안 남음.
+
+    추가 (gemini PR #19 Major): 실패 시 thread.id 와 traceback 이 로그에 남아야 한다.
+    개수만 합산해서는 어떤 thread 가 어떤 예외로 실패했는지 추적 불가.
     """
     (tmp_path / "f1.py").write_text("x\n", encoding="utf-8")
     (tmp_path / "f2.py").write_text("y\n", encoding="utf-8")
@@ -289,7 +294,9 @@ async def test_continues_processing_when_one_thread_reply_fails(tmp_path: Path) 
     github = _FlakyGitHub(threads=threads)
     uc = _make_use_case(github, tmp_path)
 
-    await uc.execute(_pr())
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="codex_review.application.follow_up_use_case"):
+        await uc.execute(_pr())
 
     # 두 thread 모두 resolve 가 먼저 호출돼 성공 — 가시적 효과(unresolved 카운트 감소)
     # 는 두 thread 다 달성. T_1 reply 만 실패해 마커 미부착 → 다음 push 에서 재시도
@@ -297,6 +304,13 @@ async def test_continues_processing_when_one_thread_reply_fails(tmp_path: Path) 
     assert sorted(github.resolved_ids) == ["T_1", "T_2"]
     # T_1 의 reply 는 실패했으므로 게시된 reply 는 T_2 것 한 건만.
     assert [cid for cid, _ in github.replies] == [2]
+    # 실패 로그에 thread.id 와 RuntimeError 가 같이 남아야 운영자가 원인을 추적 가능.
+    failure_log = next(
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "failed" in r.getMessage() and "T_1" in r.getMessage()
+    )
+    assert failure_log.exc_info is not None
+    assert failure_log.exc_info[0] is RuntimeError
 
 
 async def test_line_count_handles_file_without_trailing_newline(tmp_path: Path) -> None:

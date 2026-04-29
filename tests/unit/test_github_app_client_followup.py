@@ -565,7 +565,8 @@ async def test_list_review_threads_marker_with_null_author_still_recognized(
     assert len(threads) == 1
     # marker 가 신원 보증 → 타인 답글로 카운트하지 않음.
     assert threads[0].has_non_root_author_reply is False
-    # 단, has_followup_marker 는 author 가 root 와 정확히 같을 때만 True 로 두는 기존
-    # 멱등성 정책을 유지 (식별 불가 author 는 우리 marker 선언에 사용하지 않음 — 다음
-    # follow-up 시 새로 marker 답글을 달지 여부는 별도 판단).
-    assert threads[0].has_followup_marker is False
+    # 멱등성 보강 (coderabbit PR #19 Major 회귀): marker 가 있으면 author 메타와 무관
+    # 하게 has_followup_marker=True. 이전 정책은 `author==root_author` 일 때만 True
+    # 로 둬서, GitHub 가 우리 follow-up 댓글의 author 메타를 잃어버린 케이스에 다음
+    # 사이클이 같은 스레드에 또 답글을 다는 중복 게시가 발생했다.
+    assert threads[0].has_followup_marker is True

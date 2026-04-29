@@ -531,16 +531,20 @@ def _parse_review_thread(raw: dict[str, Any]) -> ReviewThread | None:
     #     로 간주해 has_other_author=True. 즉 식별 불가 답글은 무조건 "타인 답글" 쪽으로
     #     기울인다 — false positive (무해한 차단) 보다 false negative (인간 답글 무시하고
     #     resolve) 가 훨씬 위험하기 때문.
+    # marker 신원 보증 확장 (coderabbit PR #19 Major): marker 자체가 우리 시그니처
+    # 이므로 author 가 비어 있어도 우리 follow-up 답글로 인식해야 멱등성이 유지된다.
+    # 이전 구현은 `author == root_author` 일 때만 has_followup_marker 를 세워서, GitHub
+    # 가 author 메타를 잃어버린 기존 follow-up 댓글이 다음 사이클에 다시 후보로 통과하고
+    # 중복 답글을 게시하는 경로가 있었다. marker 만 있으면 무조건 멱등성 플래그를 켠다.
     has_followup_marker = False
     has_other_author = False
     for c in comments[1:]:
         body = c.get("body") or ""
         author = ((c.get("author") or {}).get("login")) or ""
         is_our_followup = FOLLOWUP_MARKER in body
-        if is_our_followup and author == root_author:
-            has_followup_marker = True
         if is_our_followup:
-            # 우리 follow-up 답글로 식별됨 (author 가 비어도 marker 가 신원 보증).
+            # marker 가 있으면 우리 답글 — author 메타와 무관하게 멱등성 플래그 ON.
+            has_followup_marker = True
             continue
         # marker 가 없으면 우리 답글이 아님. author 가 root 와 다르거나 비어 있으면
         # 보수적으로 타인 답글로 카운트.
