@@ -6,7 +6,10 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Response
 
-from codex_review.application.follow_up_use_case import FollowUpReviewUseCase
+from codex_review.application.follow_up_use_case import (
+    FollowUpReviewUseCase,
+    normalize_bot_user_login,
+)
 from codex_review.application.review_pr_use_case import ReviewPullRequestUseCase
 from codex_review.application.webhook_handler import WebhookHandler
 from codex_review.config import Settings
@@ -85,9 +88,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if settings.github_app_slug:
                 # 운영자가 `GITHUB_APP_SLUG=codex-review-bot[bot]` 처럼 이미 `[bot]` 이
                 # 포함된 값을 넣어도 `codex-review-bot[bot][bot]` 같은 잘못된 login 이
-                # 만들어지지 않도록 정규화 (coderabbitai PR #19 Minor).
-                bot_slug = settings.github_app_slug.strip().removesuffix("[bot]")
-                bot_login = f"{bot_slug}[bot]"
+                # 만들어지지 않도록 헬퍼로 정규화 (coderabbitai PR #19 Minor).
+                # 헬퍼로 분리한 이유: 순수 함수라 직접 단위 테스트 가능 — 이전 wiring
+                # 안에 인라인된 정규화는 `main.py` 분기 변경 시 회귀 검증이 어려웠음.
+                bot_login = normalize_bot_user_login(settings.github_app_slug)
                 follow_up_use_case = FollowUpReviewUseCase(
                     github=github,
                     repo_fetcher=repo_fetcher,

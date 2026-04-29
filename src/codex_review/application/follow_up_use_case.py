@@ -40,6 +40,13 @@ logger = logging.getLogger(__name__)
 # Critical). 청크 단위로 `\n` 만 세면 메모리 사용량이 chunk_size 로 상한.
 _LINE_COUNT_CHUNK_BYTES = 64 * 1024
 
+# follow-up 처리에서 GitHub API 동시 호출 상한. 너무 크면 GitHub 의 secondary rate
+# limit (REST: 30 mut/min, GraphQL: 동일 수준) 에 걸려 403/429 가 발생, follow-up
+# 전체가 흔들린다. 한 PR 당 후보 스레드는 보통 0~10건이고 각 액션은 resolve+reply
+# 두 호출이라 실제로는 수십 건 이내. 5 동시성이면 burst 흡수 + rate limit 안전
+# (gemini PR #19 Major).
+_FOLLOWUP_API_CONCURRENCY = 5
+
 
 class FollowUpReviewUseCase:
     """`bot_user_login` 가 단 unresolved 스레드 중 deterministic 판정 가능한 것만
@@ -77,11 +84,16 @@ class FollowUpReviewUseCase:
 
         # 1) repo lock 안에서는 로컬 file 읽기만 수행 (네트워크 I/O 금지) — 같은 저장소의
         #    다른 PR 처리가 락 때문에 차단되는 시간을 최소화 (gemini PR #19 Major).
+        #    분류는 동기 file I/O 라 `asyncio.to_thread` 로 워커에 오프로드 — 같은 이벤트
+        #    루프의 다른 webhook 핸들링이 큰 파일 카운트로 블로킹되지 않게 한다
+        #    (gemini PR #19 Major).
         token = await self._github.get_installation_token(pr.installation_id)
         actions: list[tuple[ReviewThread, _Action]] = []
         async with self._repo_fetcher.session(pr, token) as repo_path:
             for thread in candidates:
-                action = _classify_thread(thread, repo_path)
+                action = await asyncio.to_thread(
+                    _classify_thread, thread, repo_path
+                )
                 if action is not None:
                     actions.append((thread, action))
 
@@ -92,10 +104,15 @@ class FollowUpReviewUseCase:
             )
             return
 
-        # 2) 락 밖에서 API 호출 — `asyncio.gather` 로 병렬화. 한 thread 실패가 다른
-        #    thread 처리를 막지 않도록 `return_exceptions=True`.
+        # 2) 락 밖에서 API 호출 — `asyncio.gather` 로 병렬화하되, GitHub secondary rate
+        #    limit (~30 mut/min) 에 걸리지 않도록 `Semaphore` 로 동시성 상한. 한 thread
+        #    실패가 다른 thread 처리를 막지 않도록 `return_exceptions=True`.
+        sem = asyncio.Semaphore(_FOLLOWUP_API_CONCURRENCY)
         results = await asyncio.gather(
-            *(self._apply_action(pr, thread, action) for thread, action in actions),
+            *(
+                self._apply_action_with_limit(sem, pr, thread, action)
+                for thread, action in actions
+            ),
             return_exceptions=True,
         )
         failures = sum(1 for r in results if isinstance(r, Exception))
@@ -104,6 +121,17 @@ class FollowUpReviewUseCase:
                 "follow-up: %d/%d thread(s) failed during reply/resolve on %s#%d",
                 failures, len(results), pr.repo.full_name, pr.number,
             )
+
+    async def _apply_action_with_limit(
+        self,
+        sem: asyncio.Semaphore,
+        pr: PullRequest,
+        thread: ReviewThread,
+        action: "_Action",
+    ) -> None:
+        """`Semaphore` 로 동시 API 호출 수 상한. 본 작업은 `_apply_action` 위임."""
+        async with sem:
+            await self._apply_action(pr, thread, action)
 
     async def _apply_action(
         self, pr: PullRequest, thread: ReviewThread, action: "_Action"
@@ -156,11 +184,36 @@ class _Action:
 def _classify_thread(thread: ReviewThread, repo_path: Path) -> _Action | None:
     """현재 head 트리 기준으로 thread 가 가리키는 코드의 상태를 분류.
 
+    보안: GitHub 가 반환한 `thread.path` 는 원칙적으로 repo 경로지만, API 응답이
+    예상과 다르거나 (`/etc/passwd`, `../sibling-repo/...`) 같은 이탈 입력이 들어오면
+    저장소 밖 파일의 존재 여부를 자동 해소 판정의 근거로 쓰게 돼, 유효한 스레드를
+    잘못 닫거나 반대로 닫지 않을 수 있다 (codex + gemini PR #19 Major). `resolve()` 후
+    `is_relative_to(repo_root)` 가 아니면 안전하게 무대응으로 떨어뜨려, 분류 단계에선
+    "부정확한 정보로 자동 결정하지 않음" 원칙을 지킨다.
+
     반환값:
       - `_Action` (reply_body 포함) → 답글 게시 + thread resolve
-      - `None`                      → 무대응 (라인 그대로 / 수정됨 / 판정 불가)
+      - `None`                      → 무대응 (라인 그대로 / 수정됨 / 판정 불가 / 경계 이탈)
     """
-    full_path = repo_path / thread.path
+    repo_root = repo_path.resolve()
+    try:
+        full_path = (repo_root / thread.path).resolve()
+    except OSError:
+        # 너무 긴 경로 / 깨진 심볼릭 등은 OS 가 resolve 단계에서 거부할 수 있다.
+        logger.warning(
+            "follow-up: failed to resolve %r — skipping classification",
+            thread.path,
+        )
+        return None
+    if not full_path.is_relative_to(repo_root):
+        # 저장소 밖을 가리키는 경로 — GitHub API 가 이런 값을 줄 일은 거의 없지만,
+        # 만에 하나 들어와도 로컬 파일시스템 상태로 자동 해소 판정을 하지 않는다.
+        logger.warning(
+            "follow-up: thread path %r escapes repo root — skipping classification",
+            thread.path,
+        )
+        return None
+
     if not full_path.exists() or not full_path.is_file():
         return _Action(
             reply_body=(
@@ -215,6 +268,20 @@ def _count_lines(path: Path) -> int:
     if last_byte is not None and last_byte != 0x0A:
         count += 1
     return count
+
+
+def normalize_bot_user_login(github_app_slug: str) -> str:
+    """`GITHUB_APP_SLUG` 환경변수 값을 GitHub bot login (`<slug>[bot]`) 으로 정규화.
+
+    운영자 실수 방지: `GITHUB_APP_SLUG=codex-review-bot[bot]` 처럼 이미 `[bot]` 이
+    포함된 값이 들어오면 그대로 `f"{slug}[bot]"` 으로 합치면 `...[bot][bot]` 라는
+    잘못된 login 이 만들어진다. `removesuffix("[bot]")` 로 한 번 벗긴 뒤 다시 붙여
+    어떤 입력 형식이든 단일 표준형으로 수렴 (coderabbitai PR #19 Minor 반영).
+
+    공백 트림 + 소문자화는 하지 않는다 — GitHub login 은 대소문자 보존이지만 비교
+    시 소문자화는 호출자에서 책임 (현 시점 비교는 정확히 일치 형태로만 사용).
+    """
+    return f"{github_app_slug.strip().removesuffix('[bot]')}[bot]"
 
 
 def _wrap_with_marker(body: str) -> str:

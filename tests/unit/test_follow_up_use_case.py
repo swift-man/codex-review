@@ -222,14 +222,19 @@ async def test_skips_thread_with_outdated_line(tmp_path: Path) -> None:
 
 
 async def test_no_threads_means_only_list_call(tmp_path: Path) -> None:
-    """후보가 0이면 repo session 도 안 열어 git fetch 비용 안 든다."""
+    """후보가 0이면 reply / resolve API 가 호출되지 않는다.
+
+    이전 회귀 테스트는 `token_calls == 0` 까지 단언했지만, 실제 GitHub 클라이언트는
+    `list_review_threads()` 내부에서도 installation token 을 받아오므로 0 단언은
+    fake 의 단순화 모형에만 맞고 실 동작과 어긋난다 (coderabbitai PR #19 Minor).
+    의미 있는 보장은 "쓰기 작업이 없었다" 와 "list 1회" — 그쪽으로 좁힌다.
+    """
     github = _FakeGitHub(threads=())
     uc = _make_use_case(github, tmp_path)
 
     await uc.execute(_pr())
 
     assert github.list_calls == 1
-    assert github.token_calls == 0  # session 도 안 열렸음
     assert github.replies == []
     assert github.resolved_ids == []
 
@@ -340,6 +345,31 @@ async def test_classify_returns_none_when_line_in_file(tmp_path: Path) -> None:
     from codex_review.application.follow_up_use_case import _classify_thread
     thread = _thread(path="src/a.py", line=10)
     assert _classify_thread(thread, tmp_path) is None
+
+
+async def test_classify_skips_path_escaping_repo_root(tmp_path: Path) -> None:
+    """회귀 (codex + gemini PR #19 Major): GitHub 가 반환한 thread.path 가
+    `../../etc/passwd` 같은 이탈 경로일 때, 저장소 밖 파일 상태로 자동 해소
+    판정을 하지 않는다. resolve() + is_relative_to(repo_root) 검증으로 떨어뜨리고
+    분류 결과는 None — 즉 "안전한 무대응".
+    """
+    # 저장소 루트 밖에 실제 파일 하나를 만들어 두고, repo_root 안의 thread 가
+    # 그 파일을 가리키는 ../ 경로를 보내는 상황을 시뮬레이션.
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("x = 1\n", encoding="utf-8")
+
+    from codex_review.application.follow_up_use_case import _classify_thread
+
+    # 명백한 이탈 (`../outside.py`): repo_root 밖을 가리킨다 → None 이어야 함.
+    # exists()/line_count 어느 쪽도 호출되지 않아 자동 해소 답글이 만들어지면 안 됨.
+    thread = _thread(path="../outside.py", line=99999)
+    assert _classify_thread(thread, repo_root) is None
+
+    # 절대 경로 형태로 들어오는 경우도 동일하게 차단되어야 한다.
+    thread_abs = _thread(path=str(outside), line=99999)
+    assert _classify_thread(thread_abs, repo_root) is None
 
 
 async def test_resolve_failure_does_not_post_reply_marker(tmp_path: Path) -> None:
