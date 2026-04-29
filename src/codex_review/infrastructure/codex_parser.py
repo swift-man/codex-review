@@ -131,7 +131,16 @@ def _parse_findings(raw: object) -> list[Finding]:
 #   - 평문 안의 짧은 dict 인용 (예: "이 파라미터는 {'a': 1} 처럼 ...") 는 보존해야 한다.
 #   - body **전체**가 대략 dict literal 모양일 때만 unwrap 시도 → 평문 사용 시 false
 #     positive 가 나오지 않는다.
-_DICT_REPR_RE = re.compile(r"^\s*\{['\"](?:severity|message|body|finding)['\"]")
+#
+# 트리거 키 집합 (codex 리뷰 PR #20 반영):
+#   - 추출 루프가 인정하는 키: message / body / text / detail
+#   - 프롬프트가 금지한 outer 스키마 키: severity / path / line / finding
+# 두 집합의 합집합을 트리거에 둔다 — 모델이 outer comment dict 전체를 박은
+# (`{'path': 'x.py', 'line': 12, 'body': '실제 본문'}`) 경우도 잡아 본문에서 `body` 를
+# 추출하도록 보장.
+_DICT_REPR_RE = re.compile(
+    r"^\s*\{['\"](?:severity|path|line|message|body|text|detail|finding)['\"]"
+)
 
 
 def _sanitize_body(body: str) -> str:

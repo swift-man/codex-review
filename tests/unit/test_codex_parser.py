@@ -357,3 +357,81 @@ def test_parse_keeps_body_unchanged_when_not_dict_shape() -> None:
     body = result.findings[0].body
     assert body.startswith("문제:")
     assert "```python" in body
+
+
+# ---------------------------------------------------------------------------
+# 트리거 키 누락 회귀 (codex PR #20 리뷰)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_unwraps_text_key_dict_repr() -> None:
+    """추출 루프는 `text` 도 지원하는데 트리거 정규식이 빠뜨려 아예 정화 시도가
+    안 되던 회귀. text 키 단독 dict 도 잡혀야 한다.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "minor",
+         "body": "{\\"text\\": \\"이 변수는 사용되지 않습니다.\\"}"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body == "이 변수는 사용되지 않습니다."
+
+
+def test_parse_unwraps_detail_key_dict_repr() -> None:
+    """`detail` 키도 동일."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "minor",
+         "body": "{'detail': '경계 조건 누락'}"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body == "경계 조건 누락"
+
+
+def test_parse_unwraps_outer_comment_dict_with_path_first() -> None:
+    """모델이 outer comment 스키마 전체를 body 안에 박은 케이스.
+    (`{'path': '...', 'line': 1, 'body': '실제 본문'}`)
+    트리거가 `path` 로 시작해도 발동해 inner `body` 가 추출돼야 한다.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "major",
+         "body": "{'path': 'x.py', 'line': 1, 'severity': 'major', 'body': '경계 조건이 무시됩니다.'}"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    body = result.findings[0].body
+    assert body == "경계 조건이 무시됩니다."
+    # raw outer dict 형태가 본문에 새지 않는다.
+    assert "'path'" not in body
+    assert "'line'" not in body
+
+
+def test_parse_unwraps_outer_dict_starting_with_line_key() -> None:
+    """outer dict 의 키 순서가 다를 때도 (`line` 먼저) 트리거가 발동해야 한다."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "major",
+         "body": "{'line': 1, 'path': 'x.py', 'body': '리뷰 본문 텍스트'}"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body == "리뷰 본문 텍스트"
