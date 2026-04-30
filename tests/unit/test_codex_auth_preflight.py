@@ -108,3 +108,106 @@ async def test_verify_auth_kills_subprocess_on_cancellation(
         await _engine().verify_auth()
 
     assert events == ["kill", "wait"], "취소 시 kill → wait 순으로 정리돼야 한다"
+
+
+# ---------------------------------------------------------------------------
+# review() error logging contract — full stderr to logger, concise summary in exception
+# ---------------------------------------------------------------------------
+
+
+async def test_review_logs_full_stderr_and_raises_concise_summary(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """회귀 (운영 사고): 이전 구현은 stderr 를 RuntimeError 메시지에 통째로 박아
+    traceback summary 가 첫 줄(=Codex 시작 배너)만 보여 진단을 못 하게 했다.
+    이제는 stderr 전체를 별도 ERROR 로그에, RuntimeError 에는 마지막 줄만.
+    """
+    import logging as _logging
+
+    from codex_review.domain import FileDump, FileEntry, PullRequest, RepoRef
+
+    multi_line_stderr = (
+        b"OpenAI Codex v0.124.0-alpha.2 (research preview)\n"
+        b"--------\n"
+        b"workdir: /tmp\n"
+        b"model: gpt-5.5\n"
+        b"--------\n"
+        b"Error: model 'gpt-5.5' not available in this account\n"
+    )
+    _patch_subprocess(monkeypatch, _FakeProc(1, stdout=b"", stderr=multi_line_stderr))
+
+    pr = PullRequest(
+        repo=RepoRef("o", "r"), number=1, title="t", body="",
+        head_sha="abc", head_ref="feat", base_sha="def", base_ref="main",
+        clone_url="https://example/x.git", changed_files=("a.py",),
+        installation_id=7, is_draft=False,
+    )
+    dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x=1", size_bytes=3, is_changed=True),),
+        total_chars=3,
+    )
+
+    eng = CodexCliEngine(binary="codex", model="gpt-5.5")
+
+    with caplog.at_level(
+        _logging.ERROR, logger="codex_review.infrastructure.codex_cli_engine"
+    ):
+        with pytest.raises(RuntimeError) as exc_info:
+            await eng.review(pr, dump)
+
+    # (1) RuntimeError 메시지엔 stderr 의 **마지막 줄** + 모델명이 포함돼 진단 가능.
+    msg = str(exc_info.value)
+    assert "gpt-5.5" in msg
+    assert "model 'gpt-5.5' not available" in msg
+    # 시작 배너는 메시지에 없음 (이전엔 첫 줄로 잘려 진단 어려웠음).
+    assert "research preview" not in msg
+
+    # (2) ERROR 로그에는 multi-line stderr 전체가 보존됨.
+    full_log = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "research preview" in full_log
+    assert "model 'gpt-5.5' not available" in full_log
+    assert "rc=1" in full_log
+    assert "model=gpt-5.5" in full_log
+
+
+async def test_review_masks_credentials_in_review_engine_error_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """회귀 (codex PR #18 Critical): stderr 마지막 줄에 토큰 URL 이 있으면
+    `ReviewEngineError` 메시지에도 마스킹된 형태로만 들어가야 한다.
+    이 메시지는 logger.exception traceback 이나 PR 진단 코멘트로 흘러가는데, 현재
+    `_RedactFilter` 는 traceback 안의 exc 문자열을 재마스킹하지 않으므로 **예외 생성
+    시점에 직접 마스킹** 해야 누출 표면이 막힌다.
+    """
+    from codex_review.domain import FileDump, FileEntry, PullRequest, RepoRef
+    from codex_review.interfaces import ReviewEngineError
+
+    stderr = (
+        b"OpenAI Codex v0.124.0\n"
+        b"--------\n"
+        b"fatal: unable to access 'https://x-access-token:ghs_LEAKED@github.com/o/r.git'\n"
+    )
+    _patch_subprocess(monkeypatch, _FakeProc(1, stdout=b"", stderr=stderr))
+
+    pr = PullRequest(
+        repo=RepoRef("o", "r"), number=1, title="t", body="",
+        head_sha="abc", head_ref="feat", base_sha="def", base_ref="main",
+        clone_url="https://example/x.git", changed_files=("a.py",),
+        installation_id=7, is_draft=False,
+    )
+    dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1,
+    )
+
+    eng = CodexCliEngine(binary="codex", model="gpt-5.5")
+    with pytest.raises(ReviewEngineError) as exc_info:
+        await eng.review(pr, dump)
+
+    msg = str(exc_info.value)
+    # 토큰은 절대 메시지에 들어가면 안 된다.
+    assert "ghs_LEAKED" not in msg
+    # URL 자격증명은 마스킹된 형태로 표시.
+    assert "https://***@github.com" in msg
+    # returncode 정보는 유지 (도메인 메타데이터).
+    assert exc_info.value.returncode == 1
