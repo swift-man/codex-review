@@ -87,7 +87,13 @@ class _NoopFetcher:
     async def session(
         self, pr: PullRequest, installation_token: str
     ) -> AsyncIterator[Path]:
+        self._last_pr_sha = pr.head_sha
         yield Path(".")
+
+    async def head_sha(self, repo_path: Path) -> str:
+        # diff fallback 테스트는 follow-up 경로를 타지 않으므로 검증되진 않지만,
+        # RepoFetcher 프로토콜 준수를 위해 stub 을 둔다.
+        return getattr(self, "_last_pr_sha", "")
 
 
 @dataclass

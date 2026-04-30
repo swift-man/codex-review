@@ -317,6 +317,133 @@ async def test_use_case_posts_review_when_budget_fits(tmp_path: Path) -> None:
     assert github.posted_reviews[0][1] is expected
 
 
+async def test_followup_runs_on_synchronize_action(tmp_path: Path) -> None:
+    """회귀 (Phase 1): `synchronize` 이벤트면 main review 직전에 follow-up use case 가
+    호출돼야 한다 (PR 사이드바 unresolved 카운트가 새 review 게시 전에 갱신).
+    """
+    github = FakeGitHub(pr_to_return=_sample_pr())
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(FileDump(entries=(), total_chars=0)),
+        engine=FakeEngine(ReviewResult(summary="ok", event=ReviewEvent.COMMENT)),
+        max_input_tokens=1000,
+    )
+
+    @dataclass
+    class _FakeFollowUp:
+        called_with: list[Any] = field(default_factory=list)
+
+        async def execute(self, pr: PullRequest) -> None:
+            self.called_with.append(pr.number)
+
+    follow_up = _FakeFollowUp()
+    handler = WebhookHandler(
+        secret=SECRET, github=github, use_case=use_case,
+        follow_up_use_case=follow_up,  # type: ignore[arg-type]
+    )
+    payload: dict[str, Any] = {
+        "action": "synchronize",
+        "pull_request": {"draft": False, "number": 7},
+        "repository": {"full_name": "o/r"},
+        "installation": {"id": 7},
+    }
+    code, _reason = await handler.accept("pull_request", "d-syn", payload)
+    assert code == 202
+
+    await handler.start()
+    try:
+        await asyncio.wait_for(handler._queue.join(), timeout=2.0)  # type: ignore[attr-defined]
+    finally:
+        await handler.stop()
+
+    # follow-up 이 호출됐고, main review 도 게시됐다.
+    # (FakeGitHub.fetch_pull_request 는 _sample_pr() 그대로 돌려주므로 number=1)
+    assert follow_up.called_with == [1]
+    assert len(github.posted_reviews) == 1
+
+
+async def test_followup_skipped_on_opened_action(tmp_path: Path) -> None:
+    """opened 는 신규 PR 이라 옛 코멘트 자체가 없을 가능성이 크고, 있더라도 main review
+    가 새 review 를 어차피 게시하므로 follow-up 으로 중복 트래픽을 만들지 않는다.
+    """
+    github = FakeGitHub(pr_to_return=_sample_pr())
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(FileDump(entries=(), total_chars=0)),
+        engine=FakeEngine(ReviewResult(summary="ok", event=ReviewEvent.COMMENT)),
+        max_input_tokens=1000,
+    )
+
+    @dataclass
+    class _FakeFollowUp:
+        called: bool = False
+
+        async def execute(self, pr: PullRequest) -> None:
+            self.called = True
+
+    follow_up = _FakeFollowUp()
+    handler = WebhookHandler(
+        secret=SECRET, github=github, use_case=use_case,
+        follow_up_use_case=follow_up,  # type: ignore[arg-type]
+    )
+    payload: dict[str, Any] = {
+        "action": "opened",
+        "pull_request": {"draft": False, "number": 8},
+        "repository": {"full_name": "o/r"},
+        "installation": {"id": 7},
+    }
+    await handler.accept("pull_request", "d-open", payload)
+    await handler.start()
+    try:
+        await asyncio.wait_for(handler._queue.join(), timeout=2.0)  # type: ignore[attr-defined]
+    finally:
+        await handler.stop()
+
+    assert follow_up.called is False  # opened 는 follow-up 대상 아님
+    assert len(github.posted_reviews) == 1  # main review 는 정상 게시
+
+
+async def test_followup_failure_does_not_block_main_review(tmp_path: Path) -> None:
+    """follow-up 자체 실패가 main review 까지 막으면 운영 가용성 떨어짐.
+    follow-up 예외는 로그로만 남기고 main review 는 진행돼야 한다.
+    """
+    github = FakeGitHub(pr_to_return=_sample_pr())
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(FileDump(entries=(), total_chars=0)),
+        engine=FakeEngine(ReviewResult(summary="ok", event=ReviewEvent.COMMENT)),
+        max_input_tokens=1000,
+    )
+
+    @dataclass
+    class _BoomFollowUp:
+        async def execute(self, pr: PullRequest) -> None:
+            raise RuntimeError("follow-up boom")
+
+    handler = WebhookHandler(
+        secret=SECRET, github=github, use_case=use_case,
+        follow_up_use_case=_BoomFollowUp(),  # type: ignore[arg-type]
+    )
+    payload: dict[str, Any] = {
+        "action": "synchronize",
+        "pull_request": {"draft": False, "number": 9},
+        "repository": {"full_name": "o/r"},
+        "installation": {"id": 7},
+    }
+    await handler.accept("pull_request", "d-boom", payload)
+    await handler.start()
+    try:
+        await asyncio.wait_for(handler._queue.join(), timeout=2.0)  # type: ignore[attr-defined]
+    finally:
+        await handler.stop()
+
+    # follow-up 이 터졌지만 main review 는 정상 게시됐어야 한다.
+    assert len(github.posted_reviews) == 1
+
+
 async def test_accept_queues_valid_pr_and_returns_202(tmp_path: Path) -> None:
     handler = _build_handler(
         FakeGitHub(),

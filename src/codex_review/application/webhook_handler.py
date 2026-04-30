@@ -9,11 +9,18 @@ from codex_review.domain import RepoRef
 from codex_review.interfaces import GitHubClient
 from codex_review.logging_utils import get_delivery_logger
 
+from .follow_up_use_case import FollowUpReviewUseCase
 from .review_pr_use_case import ReviewPullRequestUseCase
 
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
+
+# follow-up 은 새 push 가 의미 있는 시점에만 실행 — 신규 PR(opened) 이나 draft 해제
+# (ready_for_review) 에는 옛 코멘트 자체가 없을 가능성이 크고, 있더라도 main review 가
+# 어차피 새 review 를 게시하므로 중복 트래픽을 만든다. `synchronize` (커밋 push) 와
+# `reopened` (재오픈) 만이 "이전 코멘트가 아직 유효한가?" 를 판정해야 할 시점.
+_FOLLOWUP_ACTIONS = {"synchronize", "reopened"}
 
 # Graceful shutdown 의 기본 타임아웃(초). 진행 중 리뷰가 이보다 오래 걸리면 강제 취소.
 _DEFAULT_SHUTDOWN_TIMEOUT = 60.0
@@ -51,6 +58,10 @@ class WebhookJob:
     repo: RepoRef
     number: int
     installation_id: int
+    # GitHub PR webhook 의 `action` 필드 (예: "opened", "synchronize", "reopened",
+    # "ready_for_review"). follow-up 처리는 새 push 인 "synchronize" 와 다시 열림 시점인
+    # "reopened" 에서만 의미가 있어 worker 가 분기에 사용한다.
+    action: str = ""
 
 
 class WebhookHandler:
@@ -70,6 +81,7 @@ class WebhookHandler:
         concurrency: int = 1,
         queue_maxsize: int | None = None,
         shutdown_timeout: float = _DEFAULT_SHUTDOWN_TIMEOUT,
+        follow_up_use_case: "FollowUpReviewUseCase | None" = None,
     ) -> None:
         # 이 클래스에 도달하기 전에 `Settings` 계층이 `concurrency > 0`, `queue_maxsize
         # is None or > 0` 을 강제하므로 런타임 방어(`max(1, …)`) 는 제거했다 —
@@ -80,6 +92,9 @@ class WebhookHandler:
         self._secret = secret.encode("utf-8")
         self._github = github
         self._use_case = use_case
+        # follow-up 은 옵트인 — Settings.GITHUB_APP_SLUG 가 설정된 경우에만 wiring 됨.
+        # None 이면 기존 main-review-only 흐름 유지.
+        self._follow_up_use_case = follow_up_use_case
         self._concurrency = concurrency
         qmax = queue_maxsize if queue_maxsize is not None else (
             self._concurrency * _DEFAULT_QUEUE_MULTIPLIER
@@ -250,6 +265,7 @@ class WebhookHandler:
             repo=RepoRef(owner=owner, name=name),
             number=number,
             installation_id=installation_id,
+            action=action,
         )
         # 큐가 가득 차면 즉시 거절 — GitHub 가 재전송하거나 운영자가 원인을 찾도록.
         # 무제한 큐는 Codex 쿼터 장애·장시간 리뷰 시 메모리와 대기시간을 무한 증가시킬 수 있다.
@@ -295,6 +311,28 @@ class WebhookHandler:
             if pr.is_draft:
                 dlog.info("skipping draft at fetch time")
                 return
+
+            # ── Follow-up (Phase 1) — 새 push / 재오픈 시에만 의미 ──────────
+            # main review 가 새 review 를 추가 게시하기 전에, 기존 봇 코멘트가 새
+            # 커밋으로 자동 해소됐는지 먼저 정리한다 (PR 사이드바 unresolved 카운트
+            # 가 즉시 줄어 PR 페이지 가독성 향상).
+            #
+            # 절대 main review 를 가로막지 않는다 — follow-up 자체 실패는 로그로만
+            # 남기고 main review 는 그대로 진행해 운영 가용성 보장.
+            if (
+                self._follow_up_use_case is not None
+                and job.action in _FOLLOWUP_ACTIONS
+            ):
+                try:
+                    await self._follow_up_use_case.execute(pr)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    dlog.exception(
+                        "follow-up failed for %s#%d (continuing with main review)",
+                        job.repo.full_name, job.number,
+                    )
+
             await self._use_case.execute(pr)
             dlog.info("done %s#%d", job.repo.full_name, job.number)
         except asyncio.CancelledError:

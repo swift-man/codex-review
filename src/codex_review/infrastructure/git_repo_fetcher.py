@@ -60,6 +60,28 @@ class GitRepoFetcher:
             repo_path = await self._checkout_locked(pr, installation_token)
             yield repo_path
 
+    async def head_sha(self, repo_path: Path) -> str:
+        """`git rev-parse HEAD` — 작업 트리가 실제로 머문 SHA. checkout 검증용
+        (codex PR #19 Major 반영, follow-up 자동 해소가 잘못된 commit 의 파일
+        상태로 valid thread 를 닫지 않게 방어).
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(repo_path), "rev-parse", "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            await kill_and_reap(proc)
+            raise
+        if proc.returncode != 0:
+            safe_stderr = _mask_tokens_in_text(stderr.decode(errors="replace").strip())
+            raise RuntimeError(
+                f"git rev-parse HEAD failed ({proc.returncode}): {safe_stderr}"
+            )
+        return stdout.decode(errors="replace").strip()
+
     async def _checkout_locked(self, pr: PullRequest, installation_token: str) -> Path:
         repo_path = self._cache_dir / pr.repo.owner / pr.repo.name
         repo_path.parent.mkdir(parents=True, exist_ok=True)

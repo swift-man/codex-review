@@ -100,6 +100,7 @@ REPO_FULL_NAME=owner/repo PR_NUMBER=1 INSTALLATION_ID=1234567 \
 | `REVIEW_CONCURRENCY` | `1` | 동시 실행 리뷰 개수. `1`=직렬, `2~`=병렬. Codex 쿼터와 맞춰 조절 |
 | `REVIEW_QUEUE_MAXSIZE` | `(concurrency × 10)` | 웹훅 큐 상한. 가득 차면 503 반환. 비우면 자동 계산 |
 | `CODEX_ENABLE_DIFF_FALLBACK` | `true` | 예산 초과 시 diff-only 모드 자동 전환. `false` 로 내리면 "리뷰 스킵 + 안내 코멘트" 경로만 사용 |
+| `GITHUB_APP_SLUG` | — | GitHub App slug (예: `codex-review-bot`). 설정 시 follow-up 기능 활성화 — `synchronize`/`reopened` 이벤트에서 봇이 단 옛 코멘트의 자동 해소 여부를 판정해 답글 + thread resolve 처리 |
 | `DRY_RUN` | `0` | `1`이면 로그만 남기고 게시 안 함 |
 
 ## 동작 규칙
