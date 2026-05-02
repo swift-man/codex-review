@@ -666,3 +666,57 @@ def test_parse_preserves_normal_prose_in_sections() -> None:
     assert result.summary == "전반적으로 깔끔합니다."
     assert result.positives == ("Protocol 패턴 적용", "테스트 커버리지 좋음")
     assert result.improvements == ("문서화 보강 권장",)
+
+
+# ---------------------------------------------------------------------------
+# LGTM with nits 정책 — minor/suggestion 만 있을 때 모델 APPROVE 보존
+# ---------------------------------------------------------------------------
+
+
+def test_parse_preserves_approve_when_only_minor_findings_present() -> None:
+    """회귀 (PR #23 정책 변경, LGTM with nits): 모델이 critical/major/must_fix
+    없이 minor/suggestion 만 남기고 명시적 APPROVE 를 반환하면 parser 가 그대로
+    보존한다. is_blocking 신호가 없으므로 강제 승격 로직이 발동하지 않는지 확인.
+    """
+    raw = """
+    {
+      "summary": "전반적으로 깔끔. 사소한 nits 만 남음.",
+      "event": "APPROVE",
+      "improvements": ["네이밍 일관성 보강"],
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "minor", "body": "변수명 모호"},
+        {"path": "x.py", "line": 5, "severity": "suggestion", "body": "리팩터 아이디어"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    # 핵심 계약: minor/suggestion 만 있으면 모델의 APPROVE 의사를 존중.
+    assert result.event == ReviewEvent.APPROVE
+    assert len(result.findings) == 2
+    # 본문 섹션에 nits 가 명시적으로 남아 있어야 — APPROVE 라고 nits 가 사라지면 안 됨.
+    assert result.improvements == ("네이밍 일관성 보강",)
+
+
+def test_parse_preserves_approve_with_only_suggestion_findings() -> None:
+    """suggestion 만 있는 케이스도 동일하게 APPROVE 보존."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "comments": [
+        {"path": "x.py", "line": 1, "severity": "suggestion", "body": "대안 제안"}
+      ]
+    }
+    """
+    assert parse_review(raw).event == ReviewEvent.APPROVE
+
+
+def test_parse_preserves_approve_with_zero_findings() -> None:
+    """기존 동작 회귀 — 지적이 0건이고 APPROVE 면 그대로 통과."""
+    raw = """
+    {
+      "summary": "이슈 없음",
+      "event": "APPROVE"
+    }
+    """
+    assert parse_review(raw).event == ReviewEvent.APPROVE
