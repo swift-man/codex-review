@@ -8,8 +8,8 @@ export GITHUB_WEBHOOK_SECRET="change-me-long-random"
 
 # --- Codex CLI ---
 # Available models (queryable via ~/.codex/models_cache.json):
-#   gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.2, codex-auto-review
-export CODEX_MODEL="gpt-5.4"
+#   gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.2, codex-auto-review
+export CODEX_MODEL="gpt-5.5"
 export CODEX_REASONING_EFFORT="high"   # low | medium | high | xhigh
 export CODEX_MAX_INPUT_TOKENS="300000"
 export CODEX_TIMEOUT_SEC="600"

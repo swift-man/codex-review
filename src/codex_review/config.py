@@ -37,7 +37,7 @@ class Settings(BaseSettings):
 
     # Codex CLI — 음수/0 타임아웃이나 토큰 한도는 리뷰를 즉시 실패시키므로 `gt=0` 로 고정.
     codex_bin: str = Field(default="codex", alias="CODEX_BIN")
-    codex_model: NonBlankStr = Field(default="gpt-5.4", alias="CODEX_MODEL")
+    codex_model: NonBlankStr = Field(default="gpt-5.5", alias="CODEX_MODEL")
     codex_reasoning_effort: str = Field(default="high", alias="CODEX_REASONING_EFFORT")
     codex_timeout_sec: int = Field(default=600, gt=0, alias="CODEX_TIMEOUT_SEC")
     codex_max_input_tokens: int = Field(default=300_000, gt=0, alias="CODEX_MAX_INPUT_TOKENS")
