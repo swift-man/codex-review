@@ -652,9 +652,12 @@ def _parse_review_thread(raw: dict[str, Any]) -> ReviewThread | None:
 
 
 def _parse_iso_datetime(value: object) -> datetime | None:
-    """`"2025-01-02T03:04:05Z"` 같은 ISO 8601 → naive datetime. 실패 시 None.
+    """`"2025-01-02T03:04:05Z"` 같은 ISO 8601 → tz-aware datetime (UTC). 실패 시 None.
 
-    `datetime.fromisoformat` 은 Python 3.11+ 에서 `Z` 접미사를 UTC 로 받아들인다.
+    `datetime.fromisoformat` 은 Python 3.11+ 에서 `Z` 접미사를 인식해 `tzinfo=UTC` 가
+    설정된 aware datetime 을 반환한다 (이전 주석은 "naive" 라고 잘못 적혀 있었음).
+    호출자는 시간 비교 / 정렬에 그대로 사용하면 된다 — 다른 aware 객체와 무리 없이
+    비교됨.
     """
     if not isinstance(value, str) or not value:
         return None

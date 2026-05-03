@@ -25,7 +25,9 @@ class ReviewComment:
     - `kind` 로 issue / inline / review-summary 구분.
     - `comment_id` 는 inline 일 때만 의미 있음 (메타리플라이 타깃). 다른 종류는 None.
     - `path` / `line` 도 inline 한정.
-    - `is_our_bot` 은 우리 codex-review 봇이 단 코멘트인지 (일관성 / 모순 모니터링).
+
+    "우리 봇 vs 다른 봇" 식별이 필요해지면 모델은 `review_model_label` footer 패턴
+    (`<sub>리뷰 모델: <code>...`) 으로 자체 추정 가능 — 데드 필드를 두지 않는다.
     """
 
     author_login: str
@@ -35,7 +37,6 @@ class ReviewComment:
     comment_id: int | None = None
     path: str | None = None
     line: int | None = None
-    is_our_bot: bool = False
 
 
 @dataclass(frozen=True)

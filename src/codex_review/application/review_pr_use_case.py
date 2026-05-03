@@ -3,10 +3,13 @@ import logging
 from collections.abc import Mapping
 from dataclasses import replace
 
+import httpx
+
 from codex_review.domain import (
     DUMP_MODE_DIFF,
     FileDump,
     Finding,
+    MetaReply,
     PullRequest,
     ReviewHistory,
     ReviewResult,
@@ -57,11 +60,14 @@ class ReviewPullRequestUseCase:
         # 이전 라운드의 PR 코멘트 / 다른 봇 의견을 history 로 가져와 prompt 컨텍스트에
         # 노출 — 모델이 동일 항목 반복 지적, deferred 신호 무시, 다른 봇 환각 미식별을
         # 피하도록 한다. fetch 실패는 비치명: 빈 history 로 fallback (첫 리뷰 동작).
+        # 단 (coderabbit PR #24 Major) 모든 예외를 삼키면 파싱 버그 / 프로토콜 오용까지
+        # 조용히 빈 history 로 숨겨져 진짜 결함을 놓친다. 네트워크 / HTTP / OS 레벨
+        # 일시 장애만 fallback 하고, 다른 예외는 그대로 전파해 워커가 실패 신호를 노출.
         try:
             history = await self._github.fetch_review_history(pr, pr.installation_id)
-        except Exception:
+        except (httpx.HTTPError, OSError, TimeoutError):
             logger.exception(
-                "fetch_review_history failed for %s#%d — proceeding with empty history",
+                "fetch_review_history transient failure for %s#%d — proceeding with empty history",
                 pr.repo.full_name, pr.number,
             )
             history = ReviewHistory()
@@ -121,22 +127,48 @@ class ReviewPullRequestUseCase:
         # meta-reply 의 의미 자체가 사라지므로 진행 안 함. 한 건이라도 실패해도 서로
         # 영향 없도록 `gather(return_exceptions=True)` (현재는 ≤1건이라 실질적으로 단일).
         if result.meta_replies:
-            await self._post_meta_replies(pr, result)
+            await self._post_meta_replies(pr, result, history)
 
-    async def _post_meta_replies(self, pr: PullRequest, result: ReviewResult) -> None:
+    async def _post_meta_replies(
+        self, pr: PullRequest, result: ReviewResult, history: ReviewHistory,
+    ) -> None:
         """모델이 산출한 메타리플라이를 다른 봇 inline review comment 의 thread 에 게시.
+
+        보안 검증 (codex PR #24 Major): 모델이 반환한 `reply_to_comment_id` 가 이번
+        라운드 history 의 inline comment id 집합에 속하는지 화이트리스트 검증한다.
+        prompt 안의 사용자 작성 텍스트나 모델 환각으로 임의 ID 가 섞여 들어와 엉뚱한
+        thread 에 봇 대댓글이 달리는 경로를 차단. 화이트리스트 외 ID 는 drop + 경고.
 
         파서 단에서 이미 `_META_REPLY_MAX=1` 로 제한되지만 방어적으로 try/except 로 묶어
         한 건 실패가 use case 흐름 (이미 review 게시 완료) 을 망치지 않게 한다.
         """
+        # history 의 inline 코멘트 id 집합. issue / review-summary 는 thread 가 없어
+        # 메타리플라이 대상이 될 수 없으므로 원천 제외.
+        allowed_ids = {
+            c.comment_id for c in history.comments
+            if c.kind == "inline" and c.comment_id is not None
+        }
+        validated: list[MetaReply] = []
+        for m in result.meta_replies:
+            if m.reply_to_comment_id not in allowed_ids:
+                logger.warning(
+                    "meta_reply target comment_id=%d not in history allowlist "
+                    "(prompt-injection or hallucination?) — dropping on %s#%d",
+                    m.reply_to_comment_id, pr.repo.full_name, pr.number,
+                )
+                continue
+            validated.append(m)
+        if not validated:
+            return
+
         results = await asyncio.gather(
             *(
                 self._github.reply_to_review_comment(pr, m.reply_to_comment_id, m.body)
-                for m in result.meta_replies
+                for m in validated
             ),
             return_exceptions=True,
         )
-        for reply, outcome in zip(result.meta_replies, results, strict=True):
+        for reply, outcome in zip(validated, results, strict=True):
             if isinstance(outcome, BaseException):
                 logger.warning(
                     "meta_reply post failed: comment_id=%d on %s#%d",

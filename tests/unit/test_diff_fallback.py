@@ -1352,14 +1352,18 @@ async def test_use_case_fetches_history_and_passes_to_engine() -> None:
 
 
 async def test_use_case_history_fetch_failure_falls_back_to_empty() -> None:
-    """history fetch 가 실패해도 use case 흐름은 멈추지 않는다 (비치명) — engine 은 빈
-    history 또는 None 받음.
+    """history fetch 가 일시 네트워크 장애로 실패해도 use case 흐름은 멈추지 않는다
+    (비치명) — engine 은 빈 history 받음. (coderabbit PR #24 Major 반영: except
+    범위를 httpx.HTTPError / OSError / TimeoutError 로 좁혔으므로 테스트도 같은
+    범위의 예외로 시뮬.)
     """
+    import httpx as _httpx
+
     @dataclass
     class _FailingHistoryGitHub(_HistoryAwareGitHub):
         async def fetch_review_history(self, pr, installation_id):
             self.fetch_calls += 1
-            raise RuntimeError("transient API outage")
+            raise _httpx.ConnectError("transient API outage")
 
     github = _FailingHistoryGitHub()
     engine = _HistoryEngine(
@@ -1389,8 +1393,22 @@ async def test_use_case_history_fetch_failure_falls_back_to_empty() -> None:
 
 
 async def test_use_case_posts_meta_replies_after_review() -> None:
-    """모델이 메타리플라이 1건 산출 → review post 후 reply_to_review_comment 호출."""
-    github = _HistoryAwareGitHub()
+    """모델이 메타리플라이 1건 산출 → review post 후 reply_to_review_comment 호출.
+
+    history 에 comment_id=42 인 inline 코멘트가 있어 allowlist 검증 통과.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",
+            kind="inline",
+            body="phantom?",
+            created_at=_dt(2026, 5, 1),
+            comment_id=42,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
     engine = _HistoryEngine(result=ReviewResult(
         summary="ok",
         event=ReviewEvent.COMMENT,
@@ -1418,6 +1436,85 @@ async def test_use_case_skips_meta_reply_post_when_none() -> None:
     """meta_replies 가 빈 튜플이면 reply 호출 단계 자체 생략 — 첫 리뷰 호환성."""
     github = _HistoryAwareGitHub()
     engine = _HistoryEngine(result=ReviewResult(summary="ok", event=ReviewEvent.COMMENT))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    assert github.replies == []
+
+
+async def test_use_case_drops_meta_reply_with_id_outside_history_allowlist() -> None:
+    """회귀 (codex PR #24 Major): 모델 환각 / prompt injection 으로 history 에 없는
+    comment_id 가 메타리플라이로 들어오면 drop. 보안 — 엉뚱한 thread 에 봇 답글 게시
+    경로 차단.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",
+            kind="inline",
+            body="유효한 inline",
+            created_at=_dt(2026, 5, 1),
+            comment_id=100,  # allowlist 의 유일한 ID
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 999 는 history 의 inline id 집합 ({100}) 에 없어 drop 돼야 함.
+        meta_replies=(MetaReply(reply_to_comment_id=999, body="환각된 응답"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # review 는 게시되지만 메타리플라이는 allowlist 외부라 drop.
+    assert len(github.posted_reviews) == 1
+    assert github.replies == []
+
+
+async def test_use_case_drops_meta_reply_targeting_non_inline_history() -> None:
+    """issue / review-summary kind 의 코멘트 id 는 thread 가 없어 메타리플라이 대상이
+    될 수 없다. 모델이 그쪽으로 답글을 시도해도 use case 단에서 drop.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="alice",
+            kind="issue",
+            body="PR 설명에 단 일반 코멘트",
+            created_at=_dt(2026, 5, 1),
+            # issue / review-summary 는 우리 도메인 객체에서 comment_id=None.
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 555 는 어디에도 없으므로 drop.
+        meta_replies=(MetaReply(reply_to_comment_id=555, body="잘못된 시도"),),
+    ))
     full_dump = FileDump(
         entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
         total_chars=1, mode=DUMP_MODE_FULL,

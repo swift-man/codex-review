@@ -110,7 +110,7 @@ def _parse_meta_replies(raw: object) -> list[MetaReply]:
         out.append(MetaReply(reply_to_comment_id=comment_id, body=body))
     if len(out) > _META_REPLY_MAX:
         logger.info(
-            "model returned %d meta_replies — capping to %d (LRU = first item)",
+            "model returned %d meta_replies — capping to %d (using model's own ordering: first item kept)",
             len(out), _META_REPLY_MAX,
         )
         out = out[:_META_REPLY_MAX]
