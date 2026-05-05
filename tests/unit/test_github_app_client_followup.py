@@ -664,7 +664,7 @@ async def test_fetch_review_history_respects_page_safety_cap(make_client) -> Non
     `_collect_pages` 가 100 페이지 cap 에서 멈춰 무한 루프 / OOM 을 방지.
 
     handler 가 항상 다음 페이지로 가리키는 Link 헤더를 반환하도록 만들고, 호출 횟수가
-    일정 상한 안에 머무는지 (≤100 페이지/엔드포인트 × 3 엔드포인트 + 토큰 1) 확인.
+    일정 상한 안에 머무는지 (≤100 페이지/엔드포인트 x 3 엔드포인트 + 토큰 1) 확인.
     """
     call_counts = {"issues": 0, "pulls_comments": 0, "pulls_reviews": 0, "token": 0}
 
@@ -694,4 +694,64 @@ async def test_fetch_review_history_respects_page_safety_cap(make_client) -> Non
     assert call_counts["pulls_comments"] == 100
     assert call_counts["pulls_reviews"] == 100
     # body 는 빈 응답이라 history 도 비어 있음 — 핵심 계약은 "무한 루프 안 빠짐".
+    assert history.is_empty
+
+
+async def test_fetch_review_history_partial_failure_preserves_other_endpoints(
+    make_client,
+) -> None:
+    """회귀 (gemini PR #24 Critical+Major): 한 엔드포인트가 일시 장애여도 다른 엔드포인트
+    의 정상 데이터는 보존된다. 이전 TaskGroup 구현은 첫 실패 시 형제 태스크를 자동
+    취소해 정상 받은 데이터까지 통째 유실했으나, 이제 gather(return_exceptions=True)
+    로 graceful degradation.
+    """
+    issue_payload = [
+        {"id": 1, "user": {"login": "alice"}, "body": "issue 정상",
+         "created_at": "2026-05-01T10:00:00Z"},
+    ]
+    inline_payload = [
+        {"id": 12345, "user": {"login": "gemini-pr-review-bot[bot]"},
+         "body": "inline 정상", "path": "x.py", "line": 10,
+         "created_at": "2026-05-01T11:00:00Z"},
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/access_tokens"):
+            return httpx.Response(200, json={"token": "ITOK", "expires_at": "2030-01-01T00:00:00Z"})
+        if path.endswith("/issues/42/comments"):
+            return httpx.Response(200, json=issue_payload)
+        if path.endswith("/pulls/42/comments"):
+            return httpx.Response(200, json=inline_payload)
+        if path.endswith("/pulls/42/reviews"):
+            # reviews 엔드포인트만 일시 장애 — 503 Service Unavailable.
+            return httpx.Response(503, json={"message": "transient outage"})
+        raise AssertionError(f"unexpected path: {path}")
+
+    client = make_client(handler)
+    history = await client.fetch_review_history(_pr(), 7)
+
+    # reviews 가 실패해도 issue / inline 은 보존돼야 한다.
+    assert len(history.comments) == 2
+    kinds = sorted(c.kind for c in history.comments)
+    assert kinds == ["inline", "issue"]
+
+
+async def test_fetch_review_history_returns_empty_when_all_endpoints_fail(
+    make_client,
+) -> None:
+    """모든 엔드포인트가 실패하면 빈 ReviewHistory — 호출자는 추가 catch 없이 안전.
+
+    DIP 회복 (gemini PR #24): 앱 계층이 httpx 등 인프라 라이브러리 예외를 catch 할
+    필요가 없도록 인프라 단에서 자체 처리.
+    """
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/access_tokens"):
+            return httpx.Response(200, json={"token": "ITOK", "expires_at": "2030-01-01T00:00:00Z"})
+        # 모든 데이터 엔드포인트 503.
+        return httpx.Response(503, json={"message": "outage"})
+
+    client = make_client(handler)
+    history = await client.fetch_review_history(_pr(), 7)
+
     assert history.is_empty

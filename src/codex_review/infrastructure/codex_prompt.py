@@ -1,3 +1,5 @@
+from collections import deque
+
 from codex_review.domain import (
     DUMP_MODE_DIFF,
     FileDump,
@@ -446,15 +448,13 @@ def _format_review_history(history: ReviewHistory | None) -> str:
     if history is None or history.is_empty:
         return ""
 
-    rendered: list[str] = []
-    for c in history.comments:
-        rendered.append(_format_review_history_item(c))
-
-    # 누적 cap 초과 시 오래된 것부터 drop. `sum(...)` 을 매 반복 재계산하면 O(N²) 라
-    # 누적 길이를 한 번 계산하고 pop 마다 차감 (gemini PR #24 Minor — 일관성).
+    # `deque` + `popleft()` 로 oldest drop O(1) 보장 (list.pop(0) 은 O(N) — gemini
+    # PR #24 Minor 연속 출현 정리). 누적 길이도 한 번 계산하고 pop 마다 차감해
+    # `sum(...)` 매 반복 재계산을 피한다.
+    rendered: deque[str] = deque(_format_review_history_item(c) for c in history.comments)
     total = sum(len(r) for r in rendered)
     while rendered and total > _HISTORY_TOTAL_CAP:
-        total -= len(rendered.pop(0))
+        total -= len(rendered.popleft())
 
     if not rendered:
         return ""
@@ -475,7 +475,7 @@ def _format_review_history(history: ReviewHistory | None) -> str:
         "     diff 와 history 를 비교해 평가하고, 처리됐으면 다시 flag 하지 마라.",
         "",
     ]
-    return "\n".join(header_lines + rendered)
+    return "\n".join(header_lines + list(rendered))
 
 
 def _format_review_history_item(c: ReviewComment) -> str:

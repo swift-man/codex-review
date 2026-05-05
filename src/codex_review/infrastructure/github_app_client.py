@@ -379,25 +379,32 @@ class GitHubAppClient:
         repo_issue = f"/repos/{pr.repo.full_name}/issues/{pr.number}"
 
         # 3개 엔드포인트 병렬 — 같은 PR 의 독립 리소스라 race 없음.
-        async with asyncio.TaskGroup() as tg:
-            issue_task = tg.create_task(
-                self._collect_pages(
-                    f"{repo_issue}/comments?per_page=100", auth=f"token {token}"
-                )
-            )
-            inline_task = tg.create_task(
-                self._collect_pages(
-                    f"{repo_pulls}/comments?per_page=100", auth=f"token {token}"
-                )
-            )
-            reviews_task = tg.create_task(
-                self._collect_pages(
-                    f"{repo_pulls}/reviews?per_page=100", auth=f"token {token}"
-                )
-            )
-        issue_items = issue_task.result()
-        inline_items = inline_task.result()
-        review_items = reviews_task.result()
+        # `asyncio.gather(return_exceptions=True)` 로 graceful degradation (gemini PR
+        # #24 Critical+Major+DIP 후속 라운드):
+        #   - 한 엔드포인트 일시 장애 시 나머지 정상 데이터는 보존 (TaskGroup 은 형제
+        #     태스크 자동 취소라 통째 유실).
+        #   - `ExceptionGroup` 대신 일반 예외 객체 반환 → 호출자가 추가 catch 불필요.
+        #   - 인프라 계층이 자체적으로 부분 실패 처리 → 앱 계층은 httpx 등 인프라
+        #     라이브러리에 직접 의존하지 않음 (DIP 회복).
+        # `get_installation_token` 실패는 별도 — 토큰 없이는 어떤 엔드포인트도 못 가서
+        # 그대로 전파해야 한다 (애초에 다음 단계 review 자체도 진행 불가).
+        results = await asyncio.gather(
+            self._collect_pages(
+                f"{repo_issue}/comments?per_page=100", auth=f"token {token}"
+            ),
+            self._collect_pages(
+                f"{repo_pulls}/comments?per_page=100", auth=f"token {token}"
+            ),
+            self._collect_pages(
+                f"{repo_pulls}/reviews?per_page=100", auth=f"token {token}"
+            ),
+            return_exceptions=True,
+        )
+        endpoint_labels = ("issues/comments", "pulls/comments", "pulls/reviews")
+        issue_items, inline_items, review_items = (
+            self._extract_history_page(label, result, pr)
+            for label, result in zip(endpoint_labels, results, strict=True)
+        )
 
         comments: list[ReviewComment] = []
         comments.extend(_parse_issue_comments(issue_items))
@@ -407,6 +414,27 @@ class GitHubAppClient:
         # 정렬 후 다시 튜플로. created_at 동률은 안정 정렬로 입력 순서 유지.
         comments.sort(key=lambda c: c.created_at)
         return ReviewHistory(comments=tuple(comments))
+
+    def _extract_history_page(
+        self, label: str, result: object, pr: PullRequest
+    ) -> list[Any]:
+        """gather 결과 1건 → 항목 리스트. 예외였으면 경고 로그 + 빈 리스트로 강등.
+
+        부분 실패 graceful degradation — 한 엔드포인트가 일시 장애여도 나머지 정상
+        데이터로 history 컨텍스트를 채운다.
+        """
+        if isinstance(result, BaseException):
+            logger.warning(
+                "fetch_review_history: %s endpoint failed for %s#%d — "
+                "proceeding with partial data",
+                label, pr.repo.full_name, pr.number,
+                exc_info=result,
+            )
+            return []
+        if isinstance(result, list):
+            return result
+        # _collect_pages 가 dict 등 비정상 응답을 반환한 케이스 (이론상 없지만 방어).
+        return []
 
     async def _collect_pages(self, url_or_path: str, *, auth: str) -> list[Any]:
         """`Link rel=next` 따라 끝까지 순회하며 모든 페이지 항목을 평탄화해 반환.

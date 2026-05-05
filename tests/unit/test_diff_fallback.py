@@ -1351,21 +1351,17 @@ async def test_use_case_fetches_history_and_passes_to_engine() -> None:
     assert len(github.posted_reviews) == 1
 
 
-async def test_use_case_history_fetch_failure_falls_back_to_empty() -> None:
-    """history fetch 가 일시 네트워크 장애로 실패해도 use case 흐름은 멈추지 않는다
-    (비치명) — engine 은 빈 history 받음. (coderabbit PR #24 Major 반영: except
-    범위를 httpx.HTTPError / OSError / TimeoutError 로 좁혔으므로 테스트도 같은
-    범위의 예외로 시뮬.)
+async def test_use_case_accepts_empty_history_from_infra_after_total_failure() -> None:
+    """infra 가 모든 엔드포인트 실패 시 빈 ReviewHistory 를 반환하는 contract 를 따른다
+    (gemini PR #24 Critical+Major+DIP 후속 라운드).
+
+    이전 정책은 use case 가 httpx.HTTPError 등을 직접 catch 했으나, asyncio.TaskGroup
+    이 ExceptionGroup 을 던지는 패턴을 그 catch 가 못 잡아 워커 크래시 가능성이
+    있었다. 또한 인프라 라이브러리 (httpx) 예외를 앱 계층에서 잡는 건 DIP 위반이라,
+    `GitHubAppClient.fetch_review_history` 가 자체적으로 부분 실패를 graceful 처리
+    하고 항상 ReviewHistory 객체를 반환하도록 이동. use case 는 catch 코드가 없다.
     """
-    import httpx as _httpx
-
-    @dataclass
-    class _FailingHistoryGitHub(_HistoryAwareGitHub):
-        async def fetch_review_history(self, pr, installation_id):
-            self.fetch_calls += 1
-            raise _httpx.ConnectError("transient API outage")
-
-    github = _FailingHistoryGitHub()
+    github = _HistoryAwareGitHub(history=ReviewHistory())  # infra 가 빈 history 반환
     engine = _HistoryEngine(
         result=ReviewResult(summary="ok", event=ReviewEvent.COMMENT)
     )

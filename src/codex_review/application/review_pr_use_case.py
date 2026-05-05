@@ -3,8 +3,6 @@ import logging
 from collections.abc import Mapping
 from dataclasses import replace
 
-import httpx
-
 from codex_review.domain import (
     DUMP_MODE_DIFF,
     FileDump,
@@ -59,18 +57,15 @@ class ReviewPullRequestUseCase:
 
         # 이전 라운드의 PR 코멘트 / 다른 봇 의견을 history 로 가져와 prompt 컨텍스트에
         # 노출 — 모델이 동일 항목 반복 지적, deferred 신호 무시, 다른 봇 환각 미식별을
-        # 피하도록 한다. fetch 실패는 비치명: 빈 history 로 fallback (첫 리뷰 동작).
-        # 단 (coderabbit PR #24 Major) 모든 예외를 삼키면 파싱 버그 / 프로토콜 오용까지
-        # 조용히 빈 history 로 숨겨져 진짜 결함을 놓친다. 네트워크 / HTTP / OS 레벨
-        # 일시 장애만 fallback 하고, 다른 예외는 그대로 전파해 워커가 실패 신호를 노출.
-        try:
-            history = await self._github.fetch_review_history(pr, pr.installation_id)
-        except (httpx.HTTPError, OSError, TimeoutError):
-            logger.exception(
-                "fetch_review_history transient failure for %s#%d — proceeding with empty history",
-                pr.repo.full_name, pr.number,
-            )
-            history = ReviewHistory()
+        # 피하도록 한다.
+        #
+        # 부분 실패 처리는 인프라 계층에서 자체 수행 (gemini PR #24 Critical+Major+DIP
+        # 후속 라운드): `GitHubAppClient.fetch_review_history` 가 3개 엔드포인트를
+        # `gather(return_exceptions=True)` 로 호출해 한 엔드포인트 일시 장애 시 나머지
+        # 정상 데이터로 history 를 채우고, 모두 실패해도 빈 ReviewHistory 를 반환한다.
+        # 따라서 use case 는 httpx 등 인프라 라이브러리 예외를 직접 catch 할 필요가 없다 —
+        # 계층 간 의존성 깨끗하게 유지 (DIP).
+        history = await self._github.fetch_review_history(pr, pr.installation_id)
 
         # 저장소 락 범위를 checkout ~ 파일 수집 전체로 확대한다. 이전 구현은 `checkout()`
         # 리턴과 동시에 락이 풀려, 같은 저장소의 다른 PR 이 head SHA 를 바꾸는 동안
