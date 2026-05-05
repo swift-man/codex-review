@@ -443,13 +443,31 @@ class GitHubAppClient:
         악의적 / 비정상적으로 코멘트 수가 매우 많은 PR 에서 무한 루프 / OOM /
         secondary rate limit 초과를 막기 위해 100 페이지 (=10K 항목, per_page=100)
         까지만 순회. GraphQL `list_review_threads` 쪽 페이지네이션과 동일한 cap.
+
+        Mid-page partial preservation (gemini PR #24 후속 라운드 Minor): 후반부
+        페이지에서 httpx.HTTPError / OSError / TimeoutError 가 발생하면 이전까지
+        성공적으로 모은 페이지 데이터까지 통째 유실되던 문제 해소. 예외를 try/except
+        로 잡고 break — 그 시점까지 수집된 항목은 반환되고 호출자는 graceful
+        degradation 으로 부분 데이터를 활용. 알 수 없는 예외 (파싱 버그 등) 는
+        그대로 전파해 진짜 결함을 숨기지 않는다.
         """
         out: list[Any] = []
         next_url: str | None = url_or_path
         for _ in range(100):
             if not next_url:
                 break
-            page, next_url = await self._get_page_with_next(next_url, auth=auth)
+            try:
+                page, next_url = await self._get_page_with_next(next_url, auth=auth)
+            except (httpx.HTTPError, OSError, TimeoutError):
+                # 일시 장애 — 부분 데이터 보존 후 종료. 호출자 (fetch_review_history)
+                # 의 gather(return_exceptions=True) 가 결과 리스트로 받으므로 다른
+                # 엔드포인트의 정상 데이터는 유지.
+                logger.warning(
+                    "_collect_pages: transient failure mid-pagination for %s "
+                    "— preserving %d items collected so far",
+                    url_or_path, len(out),
+                )
+                break
             if isinstance(page, list):
                 out.extend(page)
             else:

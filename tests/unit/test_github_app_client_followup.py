@@ -755,3 +755,45 @@ async def test_fetch_review_history_returns_empty_when_all_endpoints_fail(
     history = await client.fetch_review_history(_pr(), 7)
 
     assert history.is_empty
+
+
+async def test_collect_pages_preserves_partial_data_on_mid_page_failure(
+    make_client,
+) -> None:
+    """회귀 (gemini PR #24 후속 라운드 Minor): `_collect_pages` 가 후반부 페이지에서
+    httpx.HTTPError 를 만나도 이전까지 모은 데이터를 보존하고 graceful 하게 종료.
+    이전 구현은 예외가 그대로 전파돼 이미 수집된 항목까지 통째 유실됐음.
+
+    fetch_review_history 의 `gather(return_exceptions=True)` 와 함께 동작 시 부분
+    데이터 보존이 single-endpoint 단위까지 일관되게 적용된다.
+    """
+    pages_returned = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal pages_returned
+        path = req.url.path
+        if path.endswith("/access_tokens"):
+            return httpx.Response(200, json={"token": "ITOK", "expires_at": "2030-01-01T00:00:00Z"})
+        # `/issues/42/comments` 만 호출됨 — 다른 엔드포인트는 빈 응답.
+        if not path.endswith("/issues/42/comments"):
+            return httpx.Response(200, json=[])
+
+        pages_returned += 1
+        if pages_returned == 1:
+            # 1페이지: 정상 응답 + 다음 페이지 Link.
+            next_url = "https://api.github.com" + path + "?page=2"
+            return httpx.Response(
+                200,
+                json=[{"id": 1, "user": {"login": "alice"},
+                       "body": "page-1 정상", "created_at": "2026-05-01T10:00:00Z"}],
+                headers={"Link": f'<{next_url}>; rel="next"'},
+            )
+        # 2페이지: 일시 장애 503.
+        return httpx.Response(503, json={"message": "transient outage"})
+
+    client = make_client(handler)
+    history = await client.fetch_review_history(_pr(), 7)
+
+    # 1페이지의 정상 데이터는 보존돼야 한다 — 2페이지 장애로 통째 유실 X.
+    assert len(history.comments) == 1
+    assert history.comments[0].body == "page-1 정상"

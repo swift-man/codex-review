@@ -1526,3 +1526,45 @@ async def test_use_case_drops_meta_reply_targeting_non_inline_history() -> None:
     await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
 
     assert github.replies == []
+
+
+async def test_use_case_drops_meta_reply_targeting_human_inline_comment() -> None:
+    """회귀 (coderabbit PR #24 Major): 메타리플라이 allowlist 는 **봇 작성** inline 만
+    포함해야 한다. 사람 리뷰어의 inline ID 를 모델이 골라 사람 스레드에 봇이 답글
+    다는 경로 차단. PR 의도는 '다른 봇 의견에 대한 후속 답글' 이라 사람 코멘트는 scope 밖.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="human-reviewer",  # 사람 — [bot] suffix 없음.
+            kind="inline",
+            body="사람이 단 inline 코멘트",
+            created_at=_dt(2026, 5, 1),
+            comment_id=200,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 200 은 history 에 있지만 사람 작성 → allowlist 통과 X.
+        meta_replies=(MetaReply(reply_to_comment_id=200, body="사람한테 답글"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # 사람 inline 이라 drop. 메인 review 는 정상 게시.
+    assert github.replies == []
+    assert len(github.posted_reviews) == 1
