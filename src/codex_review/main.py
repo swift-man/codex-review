@@ -73,6 +73,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 DiffContextCollector() if settings.enable_diff_fallback else None
             )
 
+            # 봇 본인 식별용 GitHub login (예: `codex-review-bot[bot]`).
+            # follow-up + 메타리플라이 self-exclusion 양쪽에 공유. `GITHUB_APP_SLUG`
+            # 미설정 시 None — self-exclusion 미적용 (단순 [bot] suffix 검사만).
+            bot_login: str | None = None
+            if settings.github_app_slug:
+                # `[bot]` suffix 중복 / 공백 정규화. 순수 함수라 단위 테스트 직접 가능.
+                bot_login = normalize_bot_user_login(settings.github_app_slug)
+
             use_case = ReviewPullRequestUseCase(
                 github=github,
                 repo_fetcher=repo_fetcher,
@@ -80,18 +88,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 engine=engine,
                 max_input_tokens=settings.codex_max_input_tokens,
                 diff_context_collector=diff_collector,
+                bot_login=bot_login,
             )
 
             # Phase 1 follow-up — `GITHUB_APP_SLUG` 가 설정된 경우에만 활성화. 슬러그를
             # 알아야 우리 봇이 단 코멘트를 정확히 식별할 수 있어 옵트인 설계.
             follow_up_use_case: FollowUpReviewUseCase | None = None
-            if settings.github_app_slug:
-                # 운영자가 `GITHUB_APP_SLUG=codex-review-bot[bot]` 처럼 이미 `[bot]` 이
-                # 포함된 값을 넣어도 `codex-review-bot[bot][bot]` 같은 잘못된 login 이
-                # 만들어지지 않도록 헬퍼로 정규화 (coderabbitai PR #19 Minor).
-                # 헬퍼로 분리한 이유: 순수 함수라 직접 단위 테스트 가능 — 이전 wiring
-                # 안에 인라인된 정규화는 `main.py` 분기 변경 시 회귀 검증이 어려웠음.
-                bot_login = normalize_bot_user_login(settings.github_app_slug)
+            if bot_login:
                 follow_up_use_case = FollowUpReviewUseCase(
                     github=github,
                     repo_fetcher=repo_fetcher,

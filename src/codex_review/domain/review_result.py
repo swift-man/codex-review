@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 from .finding import Finding, ReviewEvent
+from .review_history import MetaReply
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,10 @@ class ReviewResult:
     improvements: tuple[str, ...] = field(default_factory=tuple)
     findings: tuple[Finding, ...] = field(default_factory=tuple)
     dropped_findings: tuple[Finding, ...] = field(default_factory=tuple)
+    # 다른 봇의 inline review comment 에 다는 대댓글 (≤1건 권장). use case 가 review
+    # post 후 `reply_to_review_comment` 로 게시. 빈 튜플이면 메타리플라이 게시 단계
+    # 자체를 건너뛴다 — 기존 동작 회귀 보호.
+    meta_replies: tuple[MetaReply, ...] = field(default_factory=tuple)
 
     def render_body(self) -> str:
         parts: list[str] = [self.summary.strip()]

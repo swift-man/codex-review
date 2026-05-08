@@ -324,6 +324,10 @@ class _InstrumentedGitHub:
     async def get_installation_token(self, installation_id: int) -> str:
         return "T"
 
+    async def fetch_review_history(self, pr, installation_id):
+        from codex_review.domain import ReviewHistory
+        return ReviewHistory()
+
 
 class _SlowButFinishingEngine:
     """review() 가 짧은 시간 뒤 완료되는 엔진. stop() 이 이를 기다리는지 검증."""
@@ -331,7 +335,7 @@ class _SlowButFinishingEngine:
     def __init__(self) -> None:
         self.started = asyncio.Event()
 
-    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
         self.started.set()
         # 충분히 짧아 테스트 전체 타임아웃에 잡히지 않지만, stop() 이 tombstone 전에 도착할
         # 만큼은 긴 시간.

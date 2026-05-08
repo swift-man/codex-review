@@ -81,6 +81,11 @@ class _CapturingGitHub:
     async def get_installation_token(self, installation_id: int) -> str:
         return "tkn"
 
+    async def fetch_review_history(self, pr, installation_id):
+        # diff fallback 테스트는 history 미사용 — 빈 history 로 첫 리뷰 동작 시뮬.
+        from codex_review.domain import ReviewHistory
+        return ReviewHistory()
+
 
 class _NoopFetcher:
     @asynccontextmanager
@@ -113,7 +118,7 @@ class _CapturingEngine:
     result: ReviewResult
     seen_dumps: list[FileDump] = field(default_factory=list)
 
-    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
         self.seen_dumps.append(dump)
         return self.result
 
@@ -834,7 +839,7 @@ class _FailingEngine:
     full_error_msg: str = "codex exec failed (rc=1, model=gpt-5.5): context length exceeded"
     seen_dumps: list[FileDump] = field(default_factory=list)
 
-    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
         self.seen_dumps.append(dump)
         if dump.mode == DUMP_MODE_FULL:
             raise ReviewEngineError(self.full_error_msg, returncode=1)
@@ -847,7 +852,7 @@ class _AlwaysFailingEngine:
     error_msg: str = "codex exec failed (rc=1): something deeply broken"
     seen_dumps: list[FileDump] = field(default_factory=list)
 
-    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
         self.seen_dumps.append(dump)
         raise ReviewEngineError(self.error_msg, returncode=1)
 
@@ -926,7 +931,7 @@ async def test_preemptive_diff_fallback_badge_says_budget_overflow() -> None:
     class _OkOnDiff:
         seen_dumps: list[FileDump] = field(default_factory=list)
 
-        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
             self.seen_dumps.append(dump)
             return ReviewResult(event=ReviewEvent.COMMENT, summary="ok\n")
 
@@ -1042,7 +1047,7 @@ async def test_use_case_propagates_non_engine_errors_without_fallback() -> None:
     class _BuggyEngine:
         seen_dumps: list[FileDump] = field(default_factory=list)
 
-        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
             self.seen_dumps.append(dump)
             # 의도적으로 무관한 버그 (엔진 입력 거부가 아님)
             raise KeyError("config_section")
@@ -1086,7 +1091,7 @@ async def test_diagnostic_comment_masks_credentials_in_exception_message() -> No
     class _LeakingEngine:
         seen_dumps: list[FileDump] = field(default_factory=list)
 
-        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
             self.seen_dumps.append(dump)
             # 엔진이 마스킹 안 한 채로 토큰 URL 이 들어간 메시지를 raise — 다른 엔진
             # 구현/향후 변경에서 발생할 수 있는 시나리오.
@@ -1132,7 +1137,7 @@ async def test_diagnostic_comment_escapes_triple_backtick_in_exception() -> None
     class _BacktickEngine:
         seen_dumps: list[FileDump] = field(default_factory=list)
 
-        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
             self.seen_dumps.append(dump)
             # 백틱 3개가 포함된 메시지 — 코드펜스 깨짐 유발 시도
             raise ReviewEngineError(
@@ -1254,3 +1259,503 @@ def test_pull_request_diff_patches_external_mutation_does_not_leak() -> None:
     pr = _pr(patches=mutable)
     mutable["b.py"] = "patch2"  # 생성 이후 원본 변경
     assert "b.py" not in pr.diff_patches
+
+
+# ---------------------------------------------------------------------------
+# Review history fetch + meta_replies 게시 — Use case 통합
+# ---------------------------------------------------------------------------
+
+
+from datetime import datetime as _dt
+
+from codex_review.domain import (
+    MetaReply,
+    ReviewComment,
+    ReviewHistory,
+)
+
+
+@dataclass
+class _HistoryAwareGitHub:
+    """history fetch 와 reply_to_review_comment 를 캡쳐하는 더블."""
+    history: ReviewHistory = field(default_factory=ReviewHistory)
+    posted_reviews: list = field(default_factory=list)
+    posted_comments: list = field(default_factory=list)
+    replies: list[tuple[int, str]] = field(default_factory=list)
+    fetch_calls: int = 0
+
+    async def fetch_pull_request(self, repo, number, installation_id):
+        raise AssertionError("not used")
+
+    async def post_review(self, pr, result):
+        self.posted_reviews.append((pr, result))
+
+    async def post_comment(self, pr, body):
+        self.posted_comments.append((pr, body))
+
+    async def get_installation_token(self, installation_id):
+        return "tkn"
+
+    async def fetch_review_history(self, pr, installation_id):
+        self.fetch_calls += 1
+        return self.history
+
+    async def reply_to_review_comment(self, pr, comment_id, body):
+        self.replies.append((comment_id, body))
+
+
+@dataclass
+class _HistoryEngine:
+    """history 가 그대로 전달되는지 캡쳐 + 결과 반환."""
+    result: ReviewResult
+    seen_history: list[ReviewHistory | None] = field(default_factory=list)
+
+    async def review(self, pr, dump, *, history=None):
+        self.seen_history.append(history)
+        return self.result
+
+
+async def test_use_case_fetches_history_and_passes_to_engine() -> None:
+    """use case 실행 시 history 를 fetch 하고 engine.review 에 그대로 전달하는지."""
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",
+            kind="inline",
+            body="prior comment",
+            created_at=_dt(2026, 5, 1),
+            comment_id=999,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(
+        result=ReviewResult(summary="ok", event=ReviewEvent.COMMENT)
+    )
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    assert github.fetch_calls == 1
+    assert engine.seen_history == [history]
+    assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_accepts_empty_history_from_infra_after_total_failure() -> None:
+    """infra 가 모든 엔드포인트 실패 시 빈 ReviewHistory 를 반환하는 contract 를 따른다
+    (gemini PR #24 Critical+Major+DIP 후속 라운드).
+
+    이전 정책은 use case 가 httpx.HTTPError 등을 직접 catch 했으나, asyncio.TaskGroup
+    이 ExceptionGroup 을 던지는 패턴을 그 catch 가 못 잡아 워커 크래시 가능성이
+    있었다. 또한 인프라 라이브러리 (httpx) 예외를 앱 계층에서 잡는 건 DIP 위반이라,
+    `GitHubAppClient.fetch_review_history` 가 자체적으로 부분 실패를 graceful 처리
+    하고 항상 ReviewHistory 객체를 반환하도록 이동. use case 는 catch 코드가 없다.
+    """
+    github = _HistoryAwareGitHub(history=ReviewHistory())  # infra 가 빈 history 반환
+    engine = _HistoryEngine(
+        result=ReviewResult(summary="ok", event=ReviewEvent.COMMENT)
+    )
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    assert github.fetch_calls == 1
+    # engine 은 빈 history 받음 — 첫 리뷰 호환성 동작.
+    assert len(engine.seen_history) == 1
+    seen = engine.seen_history[0]
+    assert seen is not None and seen.is_empty
+    # 리뷰 게시는 정상 진행.
+    assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_posts_meta_replies_after_review() -> None:
+    """모델이 메타리플라이 1건 산출 → review post 후 reply_to_review_comment 호출.
+
+    history 에 comment_id=42 인 다른 봇 inline 코멘트 + `bot_login` 주입 → allowlist
+    검증 통과.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",  # 다른 봇
+            kind="inline",
+            body="phantom?",
+            created_at=_dt(2026, 5, 1),
+            comment_id=42,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        meta_replies=(MetaReply(reply_to_comment_id=42, body="phantom 가능성"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",  # 자기 봇 식별 — 메타리플라이 활성 조건
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    assert len(github.posted_reviews) == 1  # 메인 리뷰 게시
+    assert github.replies == [(42, "phantom 가능성")]
+
+
+async def test_use_case_skips_meta_reply_post_when_none() -> None:
+    """meta_replies 가 빈 튜플이면 reply 호출 단계 자체 생략 — 첫 리뷰 호환성."""
+    github = _HistoryAwareGitHub()
+    engine = _HistoryEngine(result=ReviewResult(summary="ok", event=ReviewEvent.COMMENT))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    assert github.replies == []
+
+
+async def test_use_case_drops_meta_reply_with_id_outside_history_allowlist() -> None:
+    """회귀 (codex PR #24 Major): 모델 환각 / prompt injection 으로 history 에 없는
+    comment_id 가 메타리플라이로 들어오면 drop. 보안 — 엉뚱한 thread 에 봇 답글 게시
+    경로 차단. bot_login 주입해 self-exclusion 정책으로 drop 되는 게 아니라 ID 불일치
+    로 drop 됨을 명확히 한다.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",
+            kind="inline",
+            body="유효한 inline",
+            created_at=_dt(2026, 5, 1),
+            comment_id=100,  # allowlist 의 유일한 ID
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 999 는 history 의 inline id 집합 ({100}) 에 없어 drop 돼야 함.
+        meta_replies=(MetaReply(reply_to_comment_id=999, body="환각된 응답"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # review 는 게시되지만 메타리플라이는 allowlist 외부라 drop.
+    assert len(github.posted_reviews) == 1
+    assert github.replies == []
+
+
+async def test_use_case_drops_meta_reply_targeting_non_inline_history() -> None:
+    """issue / review-summary kind 의 코멘트 id 는 thread 가 없어 메타리플라이 대상이
+    될 수 없다. 모델이 그쪽으로 답글을 시도해도 use case 단에서 drop.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="alice",
+            kind="issue",
+            body="PR 설명에 단 일반 코멘트",
+            created_at=_dt(2026, 5, 1),
+            # issue / review-summary 는 우리 도메인 객체에서 comment_id=None.
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 555 는 어디에도 없으므로 drop.
+        meta_replies=(MetaReply(reply_to_comment_id=555, body="잘못된 시도"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    assert github.replies == []
+
+
+async def test_use_case_drops_meta_reply_targeting_human_inline_comment() -> None:
+    """회귀 (coderabbit PR #24 Major): 메타리플라이 allowlist 는 **봇 작성** inline 만
+    포함해야 한다. 사람 리뷰어의 inline ID 를 모델이 골라 사람 스레드에 봇이 답글
+    다는 경로 차단. PR 의도는 '다른 봇 의견에 대한 후속 답글' 이라 사람 코멘트는 scope 밖.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="human-reviewer",  # 사람 — [bot] suffix 없음.
+            kind="inline",
+            body="사람이 단 inline 코멘트",
+            created_at=_dt(2026, 5, 1),
+            comment_id=200,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 200 은 history 에 있지만 사람 작성 → allowlist 통과 X.
+        meta_replies=(MetaReply(reply_to_comment_id=200, body="사람한테 답글"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # 사람 inline 이라 drop. 메인 review 는 정상 게시.
+    assert github.replies == []
+    assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_drops_meta_reply_targeting_self_bot() -> None:
+    """회귀 (codex+gemini PR #24 후속 라운드 Major+Minor): allowlist 가 자기 봇도
+    허용하면 자기 코멘트에 자기 답글 다는 무한 루프 가능성. `bot_login` 이 주입되면
+    동일 author 는 allowlist 에서 제외돼야 한다.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="codex-review-bot[bot]",  # 우리 봇 자신
+            kind="inline",
+            body="우리 봇이 단 이전 라운드 코멘트",
+            created_at=_dt(2026, 5, 1),
+            comment_id=300,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 300 은 [bot] suffix 통과하지만 self-exclusion 으로 drop.
+        meta_replies=(MetaReply(reply_to_comment_id=300, body="자기 답글"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",  # self-exclusion 활성화
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # 자기 봇 inline 이라 drop. 메인 review 는 정상 게시.
+    assert github.replies == []
+    assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_disables_meta_replies_when_bot_login_unknown() -> None:
+    """회귀 (codex PR #24 후속 라운드 Major): `bot_login=None` (GITHUB_APP_SLUG 미설정)
+    이면 자기 봇 식별이 불가능 → 메타리플라이 자체를 비활성화. 그래야 자기 코멘트에
+    답글 다는 경로를 안전 우선으로 차단할 수 있다.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",  # 다른 봇이라도
+            kind="inline",
+            body="다른 봇 의견",
+            created_at=_dt(2026, 5, 1),
+            comment_id=400,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        meta_replies=(MetaReply(reply_to_comment_id=400, body="응답"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        # bot_login 미주입 — None
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # bot_login None → 메타리플라이 비활성화. 다른 봇 inline 이라도 reply 안 감.
+    assert github.replies == []
+    # 메인 리뷰는 정상 게시.
+    assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_self_exclusion_is_case_insensitive() -> None:
+    """회귀 (gemini PR #24 후속 라운드 Minor): GitHub `author_login` 의 대소문자
+    차이로 self-exclusion 이 우회되면 안 된다. `casefold()` 비교로 대소문자 무관하게
+    자기 봇 인식.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            # 운영자 설정과 GitHub API 응답의 대소문자가 다른 케이스 시뮬.
+            author_login="Codex-Review-Bot[bot]",
+            kind="inline",
+            body="자기 봇 코멘트 (대문자 변형)",
+            created_at=_dt(2026, 5, 1),
+            comment_id=500,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        meta_replies=(MetaReply(reply_to_comment_id=500, body="대소문자 우회 시도"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        # 운영자가 설정한 정규화 결과는 모두 소문자.
+        bot_login="codex-review-bot[bot]",
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # 대소문자 다르지만 casefold() 로 동일 인식 → drop.
+    assert github.replies == []
+    assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_drops_meta_reply_targeting_a_reply_comment() -> None:
+    """회귀 (codex PR #24 후속 라운드 Major): GitHub `/pulls/{n}/comments` 응답에는
+    루트 inline 뿐 아니라 `in_reply_to_id` 가 있는 대댓글도 섞여 들어온다.
+    `is_reply=True` 항목은 allowlist 에서 제외돼 메타리플라이가 대댓글에 다시 달리지
+    않는다 (PR 의도: 다른 봇의 **원 지적** 에 메타응답).
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",
+            kind="inline",
+            body="다른 봇의 원 지적 — 루트",
+            created_at=_dt(2026, 5, 1, 10, 0, 0),
+            comment_id=600,
+            path="x.py",
+            line=1,
+            is_reply=False,  # 루트
+        ),
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",
+            kind="inline",
+            body="대댓글 — in_reply_to_id 있음",
+            created_at=_dt(2026, 5, 1, 11, 0, 0),
+            comment_id=601,
+            path="x.py",
+            line=1,
+            is_reply=True,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 601 (대댓글) 을 타깃 → drop. 600 (루트) 은 통과 가능했지만 모델이 안 골랐음.
+        meta_replies=(MetaReply(reply_to_comment_id=601, body="대댓글에 답글 시도"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # 대댓글 ID drop. 메인 review 는 정상.
+    assert github.replies == []
+    assert len(github.posted_reviews) == 1

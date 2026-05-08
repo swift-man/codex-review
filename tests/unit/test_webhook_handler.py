@@ -42,6 +42,10 @@ class FakeGitHub:
     async def get_installation_token(self, installation_id: int) -> str:
         return "fake-token"
 
+    async def fetch_review_history(self, pr, installation_id):
+        from codex_review.domain import ReviewHistory
+        return ReviewHistory()
+
 
 @dataclass
 class FakeFetcher:
@@ -68,7 +72,7 @@ class FakeEngine:
     def __init__(self, result: ReviewResult) -> None:
         self._result = result
 
-    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
         return self._result
 
 
@@ -475,7 +479,7 @@ class _SlowEngine:
         self.peak = 0
         self.release = asyncio.Event()
 
-    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
         self.in_flight += 1
         self.peak = max(self.peak, self.in_flight)
         try:
@@ -556,7 +560,7 @@ async def test_stop_preserves_in_flight_work_when_queue_is_full() -> None:
         """워커가 꺼낸 직후 event 를 set → 테스트에서 큐에 추가 job 을 채워 full 상태로 만든 후
         resume 을 set 하면 진행 중 리뷰가 정상 완료되도록 한 엔진.
         """
-        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
             review_started.set()
             await resume.wait()
             completed_reviews.append(pr.number)
@@ -625,7 +629,7 @@ async def test_stop_does_not_deadlock_when_queue_is_full() -> None:
     release = asyncio.Event()
 
     class _BlockingEngine:
-        async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
             await release.wait()  # forever
             return ReviewResult(summary="x", event=ReviewEvent.COMMENT)
 

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
@@ -6,7 +7,9 @@ from codex_review.domain import (
     DUMP_MODE_DIFF,
     FileDump,
     Finding,
+    MetaReply,
     PullRequest,
+    ReviewHistory,
     ReviewResult,
     TokenBudget,
 )
@@ -39,6 +42,7 @@ class ReviewPullRequestUseCase:
         engine: ReviewEngine,
         max_input_tokens: int,
         diff_context_collector: DiffContextCollector | None = None,
+        bot_login: str | None = None,
     ) -> None:
         self._github = github
         self._repo_fetcher = repo_fetcher
@@ -48,9 +52,25 @@ class ReviewPullRequestUseCase:
         # None 이면 fallback 을 비활성화한다 (기존 동작: 예산 초과 시 리뷰 스킵).
         # 운영자가 명시적으로 옵트인 할 수 있도록 DI 경계에서 결정.
         self._diff_collector = diff_context_collector
+        # 우리 봇 자신의 GitHub login (예: `codex-review-bot[bot]`). 메타리플라이
+        # allowlist 에서 self-exclusion 에 사용. None 이면 self-exclusion 미적용
+        # (단순 bot suffix 검사) — 운영자가 GITHUB_APP_SLUG 를 설정해야만 활성화.
+        self._bot_login = bot_login
 
     async def execute(self, pr: PullRequest) -> None:
         token = await self._github.get_installation_token(pr.installation_id)
+
+        # 이전 라운드의 PR 코멘트 / 다른 봇 의견을 history 로 가져와 prompt 컨텍스트에
+        # 노출 — 모델이 동일 항목 반복 지적, deferred 신호 무시, 다른 봇 환각 미식별을
+        # 피하도록 한다.
+        #
+        # 부분 실패 처리는 인프라 계층에서 자체 수행 (gemini PR #24 Critical+Major+DIP
+        # 후속 라운드): `GitHubAppClient.fetch_review_history` 가 3개 엔드포인트를
+        # `gather(return_exceptions=True)` 로 호출해 한 엔드포인트 일시 장애 시 나머지
+        # 정상 데이터로 history 를 채우고, 모두 실패해도 빈 ReviewHistory 를 반환한다.
+        # 따라서 use case 는 httpx 등 인프라 라이브러리 예외를 직접 catch 할 필요가 없다 —
+        # 계층 간 의존성 깨끗하게 유지 (DIP).
+        history = await self._github.fetch_review_history(pr, pr.installation_id)
 
         # 저장소 락 범위를 checkout ~ 파일 수집 전체로 확대한다. 이전 구현은 `checkout()`
         # 리턴과 동시에 락이 풀려, 같은 저장소의 다른 PR 이 head SHA 를 바꾸는 동안
@@ -91,7 +111,7 @@ class ReviewPullRequestUseCase:
         # 사유 — diff 배지 문구를 "예산 초과" vs "엔진 거부 후 재시도" 로 분기시키는 근거.
         entered_diff_preemptively = dump.mode == DUMP_MODE_DIFF
         result = await self._review_with_fallback(
-            pr, dump, entered_diff_preemptively=entered_diff_preemptively
+            pr, dump, entered_diff_preemptively=entered_diff_preemptively, history=history,
         )
         if result is None:
             return  # 진단 코멘트 게시 후 정리 종료
@@ -103,12 +123,82 @@ class ReviewPullRequestUseCase:
 
         await self._github.post_review(pr, result)
 
+        # 메타리플라이는 review post 성공 후 별도 단계로 게시. review post 가 실패했으면
+        # meta-reply 의 의미 자체가 사라지므로 진행 안 함. 한 건이라도 실패해도 서로
+        # 영향 없도록 `gather(return_exceptions=True)` (현재는 ≤1건이라 실질적으로 단일).
+        if result.meta_replies:
+            await self._post_meta_replies(pr, result, history)
+
+    async def _post_meta_replies(
+        self, pr: PullRequest, result: ReviewResult, history: ReviewHistory,
+    ) -> None:
+        """모델이 산출한 메타리플라이를 다른 봇 inline review comment 의 thread 에 게시.
+
+        보안 검증 (codex PR #24 Major): 모델이 반환한 `reply_to_comment_id` 가 이번
+        라운드 history 의 inline comment id 집합에 속하는지 화이트리스트 검증한다.
+        prompt 안의 사용자 작성 텍스트나 모델 환각으로 임의 ID 가 섞여 들어와 엉뚱한
+        thread 에 봇 대댓글이 달리는 경로를 차단. 화이트리스트 외 ID 는 drop + 경고.
+
+        파서 단에서 이미 `_META_REPLY_MAX=1` 로 제한되지만 방어적으로 try/except 로 묶어
+        한 건 실패가 use case 흐름 (이미 review 게시 완료) 을 망치지 않게 한다.
+        """
+        # history 의 inline 코멘트 id 집합 — 단 **다른 봇 작성** 코멘트만 허용:
+        #   - bot suffix `[bot]` (사람 로그인 차단 — coderabbit PR #24 Major)
+        #   - 우리 봇 자신 제외 (codex / gemini PR #24 후속 라운드 Major):
+        #     allowlist 가 자기 봇도 허용하면 자기 답글에 자기 답글 다는 무한 루프 가능.
+        #
+        # 자기 봇 식별이 불가능하면 (`_bot_login is None`) 메타리플라이 자체를 비활성화
+        # — `GITHUB_APP_SLUG` 미설정 운영 환경에서 우리가 자기 댓글을 골라도 막을 방법이
+        # 없기 때문에 안전 우선 정책 (codex PR #24 후속 라운드 Major). `casefold()` 비교
+        # 로 author_login 대소문자 차이로 우회되는 엣지 케이스 방어 (gemini Minor).
+        # issue / review-summary 는 thread 자체가 없어 원천 제외.
+        if self._bot_login is None:
+            allowed_ids: set[int] = set()
+        else:
+            self_login_cf = self._bot_login.casefold()
+            allowed_ids = {
+                c.comment_id for c in history.comments
+                if c.kind == "inline"
+                and c.comment_id is not None
+                and not c.is_reply  # 루트 inline 만 — 대댓글에 또 답글 차단 (codex PR #24)
+                and c.author_login.endswith("[bot]")
+                and c.author_login.casefold() != self_login_cf
+            }
+        validated: list[MetaReply] = []
+        for m in result.meta_replies:
+            if m.reply_to_comment_id not in allowed_ids:
+                logger.warning(
+                    "meta_reply target comment_id=%d not in history allowlist "
+                    "(prompt-injection or hallucination?) — dropping on %s#%d",
+                    m.reply_to_comment_id, pr.repo.full_name, pr.number,
+                )
+                continue
+            validated.append(m)
+        if not validated:
+            return
+
+        results = await asyncio.gather(
+            *(
+                self._github.reply_to_review_comment(pr, m.reply_to_comment_id, m.body)
+                for m in validated
+            ),
+            return_exceptions=True,
+        )
+        for reply, outcome in zip(validated, results, strict=True):
+            if isinstance(outcome, BaseException):
+                logger.warning(
+                    "meta_reply post failed: comment_id=%d on %s#%d",
+                    reply.reply_to_comment_id, pr.repo.full_name, pr.number,
+                    exc_info=outcome,
+                )
+
     async def _review_with_fallback(
         self,
         pr: PullRequest,
         dump: FileDump,
         *,
         entered_diff_preemptively: bool,
+        history: ReviewHistory | None = None,
     ) -> ReviewResult | None:
         """엔진 호출을 시도하고, full 모드 실패 시 diff 모드로 재시도. 둘 다 실패하면
         PR 에 진단 코멘트를 게시하고 None 반환 — 호출자가 종료하도록 한다.
@@ -130,7 +220,7 @@ class ReviewPullRequestUseCase:
             else _SCOPE_REACTIVE_ENGINE_REJECT
         )
         try:
-            result = await self._engine.review(pr, dump)
+            result = await self._engine.review(pr, dump, history=history)
         except ReviewEngineError as exc:
             # 이미 diff 모드 dump 로 들어와 실패한 경우 → 사전(preemptive) 예산 fallback
             # 으로 진입했다는 의미. full 시도는 일어나지 않았다 (codex PR #18 Minor 반영:
@@ -170,7 +260,7 @@ class ReviewPullRequestUseCase:
                 )
                 return None
             try:
-                result = await self._engine.review(pr, fallback_dump)
+                result = await self._engine.review(pr, fallback_dump, history=history)
             except ReviewEngineError as retry_exc:
                 logger.exception(
                     "engine retry in diff mode also failed for %s#%d",

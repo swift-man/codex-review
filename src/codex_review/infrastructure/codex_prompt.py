@@ -1,4 +1,23 @@
-from codex_review.domain import DUMP_MODE_DIFF, FileDump, FileEntry, PullRequest
+import textwrap
+from collections import deque
+
+from codex_review.domain import (
+    DUMP_MODE_DIFF,
+    FileDump,
+    FileEntry,
+    PullRequest,
+    ReviewComment,
+    ReviewHistory,
+)
+
+# REVIEW HISTORY 섹션의 직렬화 상수.
+# 한 코멘트의 본문이 너무 길면 prompt 토큰 예산을 잡아먹으므로 cap. 1500 자면 일반적인
+# 봇 리뷰 한 건이 거의 그대로 들어가지만, 비정상적으로 긴 본문은 잘려서 노이즈 차단.
+_HISTORY_PER_COMMENT_CAP = 1500
+# 전체 history 섹션의 누적 cap. UTF-8 한글 1 char ≈ 3 byte 라 12000 chars ≈ 36KB —
+# `CODEX_MAX_INPUT_TOKENS=300_000` 의 약 3% 수준이라 코드 예산을 의미 있게 잠식하지
+# 않는다. 초과 시 가장 오래된 코멘트부터 truncate.
+_HISTORY_TOTAL_CAP = 12_000
 
 SYSTEM_RULES = """\
 당신은 시니어 소프트웨어 엔지니어이자 엄격한 PR 리뷰어다.
@@ -45,9 +64,17 @@ GitHub Pull Request 의 **전체 코드베이스**를 한국어로 리뷰한다.
       "severity": "critical" | "major" | "minor" | "suggestion",
       "body":     "<해당 라인에 달 한국어 지적. '문제 → 영향 → 제안' 구조.>"
     }
+  ],
+  "meta_replies": [
+    {
+      "reply_to_comment_id": <REVIEW HISTORY 의 inline 항목에 표기된 comment_id 정수>,
+      "body": "<다른 봇 의견에 대한 짧은 한국어 응답>"
+    }
   ]
 }
 ```
+- `meta_replies` 는 선택 필드. REVIEW HISTORY 가 없거나 응답할 inline 코멘트가 없으면 빈 배열 또는 생략.
+- 최대 1건만 작성 — 가장 응답 가치 높은 다른 봇 inline 코멘트 한 건. 동의 / 반박 / defer 권장 중 명확한 의도로.
 3) 모든 텍스트는 **반드시 한국어**로 작성. 영문 문장을 섞지 마라.
 4) `comments[].line` 은 반드시 존재하는 양의 정수. 라인 번호가 확실하지 않은 지적은 `comments` 에서 제외하고 `must_fix` 또는 `improvements` 로 보낸다.
 5) `event` — 사람 시니어 리뷰어의 결정 패턴을 따른다 (`LGTM with nits` 허용):
@@ -188,8 +215,9 @@ DIFF_MODE_SYSTEM_RULES = """\
 
 ## 출력 형식
 
-- `positives` / `must_fix` / `improvements` / `comments` 를 가진 JSON 객체 한 개만 출력.
+- `positives` / `must_fix` / `improvements` / `comments` / (선택) `meta_replies` 를 가진 JSON 객체 한 개만 출력.
 - 전체 스키마·등급 체계는 표준 리뷰와 동일 (critical|major|minor|suggestion).
+- `meta_replies` — REVIEW HISTORY 가 있고 다른 봇의 inline review comment 중 응답 가치 높은 것이 있으면 최대 1건. `{"reply_to_comment_id": <정수>, "body": "<한국어>"}`. 없으면 빈 배열 또는 생략.
 - `comments[].line` 은 반드시 diff 의 RIGHT-side(`+` 측) 에 실제 존재하는 양의 정수여야 한다.
   hunk 헤더 `@@ -a,b +c,d @@` 에서 `c` 가 첫 RIGHT 라인 번호다. 거기부터 `+` 와 ` `(공백)
   접두의 라인마다 +1 씩 증가한다 (`-` 접두 라인은 RIGHT 에 없으므로 번호를 올리지 않는다).
@@ -242,18 +270,30 @@ PR 에 raw dict 문자열이 그대로 노출된다. 코드 스니펫은 펜스(
 """
 
 
-def build_prompt(pr: PullRequest, dump: FileDump) -> str:
+def build_prompt(
+    pr: PullRequest,
+    dump: FileDump,
+    *,
+    history: ReviewHistory | None = None,
+) -> str:
     """모드에 따라 시스템 규칙과 파일 포매팅을 다르게 내보낸다.
 
     - `full` (기본) — 전체 파일 내용 + 1-based 줄 번호 접두.
     - `diff`       — unified patch 원문 + diff-only 전용 규칙.
+
+    `history` 가 None 또는 비어 있으면 history 섹션 자체 생략 — 첫 리뷰 호환성.
     """
     if dump.mode == DUMP_MODE_DIFF:
-        return _build_diff_prompt(pr, dump)
-    return _build_full_prompt(pr, dump)
+        return _build_diff_prompt(pr, dump, history=history)
+    return _build_full_prompt(pr, dump, history=history)
 
 
-def _build_full_prompt(pr: PullRequest, dump: FileDump) -> str:
+def _build_full_prompt(
+    pr: PullRequest,
+    dump: FileDump,
+    *,
+    history: ReviewHistory | None = None,
+) -> str:
     sections: list[str] = [
         SYSTEM_RULES.strip(),
         "",
@@ -269,13 +309,19 @@ def _build_full_prompt(pr: PullRequest, dump: FileDump) -> str:
         "=== PR BODY ===",
         pr.body or "(empty)",
         "",
+    ]
+    history_section = _format_review_history(history)
+    if history_section:
+        sections.append(history_section)
+        sections.append("")
+    sections.extend([
         _budget_notice(dump),
         "",
         "=== FILES ===",
         "각 파일은 1-based 줄 번호가 'NNNNN| ' 접두사로 표기된다.",
         "`comments[].line` 에는 이 번호를 그대로 사용한다.",
         "",
-    ]
+    ])
     for entry in dump.entries:
         sections.append(_format_file(entry))
 
@@ -289,7 +335,12 @@ def _build_full_prompt(pr: PullRequest, dump: FileDump) -> str:
     return "\n".join(sections)
 
 
-def _build_diff_prompt(pr: PullRequest, dump: FileDump) -> str:
+def _build_diff_prompt(
+    pr: PullRequest,
+    dump: FileDump,
+    *,
+    history: ReviewHistory | None = None,
+) -> str:
     """diff-only 모드 프롬프트. `FileEntry.content` 는 이미 `=== PATCH: … ===` 헤더를
     포함한 unified patch 원문이므로 그대로 이어 붙인다.
     """
@@ -308,12 +359,18 @@ def _build_diff_prompt(pr: PullRequest, dump: FileDump) -> str:
         "=== PR BODY ===",
         pr.body or "(empty)",
         "",
+    ]
+    history_section = _format_review_history(history)
+    if history_section:
+        sections.append(history_section)
+        sections.append("")
+    sections.extend([
         _diff_mode_scope_notice(dump),
         "",
         "=== PATCHES ===",
         "아래는 PR 의 unified patch 원문이다. 각 파일은 `=== PATCH: <path> ===` 헤더 다음에 온다.",
         "",
-    ]
+    ])
     for entry in dump.entries:
         sections.append(entry.content)
         sections.append("")
@@ -373,3 +430,73 @@ def _format_file(entry: FileEntry) -> str:
         f"{i + 1:5d}| {line}" for i, line in enumerate(entry.content.splitlines())
     )
     return f"{header}\n{numbered}\n--- END FILE ---"
+
+
+def _format_review_history(history: ReviewHistory | None) -> str:
+    """이전 라운드 코멘트 / 다른 봇 리뷰를 직렬화. 비어 있으면 빈 문자열 — 호출자가
+    섹션 자체를 생략해 첫 리뷰 호환성 보존.
+
+    형식:
+      `=== REVIEW HISTORY ===` 헤더 + 시간순 항목.
+      각 항목:
+        `[<kind>] <ISO time> @<author>` (+ inline 이면 `(comment_id=..., path=..., line=...)`)
+        본문 (들여쓰기 + 1500자 cap)
+
+    토큰 예산 보호:
+      - 누적이 `_HISTORY_TOTAL_CAP` 초과하면 가장 오래된 항목부터 drop. 모델은
+        시간순으로 읽어야 하므로 머리쪽이 잘림 — 최근 라운드 정보 우선.
+    """
+    if history is None or history.is_empty:
+        return ""
+
+    # `deque` + `popleft()` 로 oldest drop O(1) 보장 (list.pop(0) 은 O(N) — gemini
+    # PR #24 Minor 연속 출현 정리). 누적 길이도 한 번 계산하고 pop 마다 차감해
+    # `sum(...)` 매 반복 재계산을 피한다.
+    rendered: deque[str] = deque(_format_review_history_item(c) for c in history.comments)
+    total = sum(len(r) for r in rendered)
+    while rendered and total > _HISTORY_TOTAL_CAP:
+        total -= len(rendered.popleft())
+
+    if not rendered:
+        return ""
+
+    header_lines = [
+        "=== REVIEW HISTORY ===",
+        "이전 라운드의 PR 코멘트와 다른 리뷰어 의견. 시간순 (오래된 → 최신). 활용 규칙:",
+        "  1. 작성자가 \"별도 PR\" / \"follow-up\" / \"deferred\" / \"환각\" / \"이미 처리\" /",
+        "     \"scope 밖\" / \"out of scope\" / \"hallucination\" 등으로 분류한 항목은 다시",
+        "     flag 하지 마라.",
+        "  2. 다른 봇이 이미 지적한 라인을 같은 결론으로 중복 지적하지 마라.",
+        "  3. 다른 봇의 inline review comment 중 **가장 응답 가치 높은 것 1건** 에 대해서",
+        "     `meta_replies` 배열에 1개 항목을 산출하라 (선택, 0건도 허용):",
+        "        {\"reply_to_comment_id\": <inline 의 comment_id 정수>, \"body\": \"<짧은 한국어>\"}",
+        "     - 동의 (보강 정보 추가) / 반박 (실제 코드 인용으로 phantom 지적) / defer 권장",
+        "       중 하나의 의도로 작성. 의례적 동의 / 일반론 / 작성자가 이미 처리한 항목은 제외.",
+        "  4. 직전 라운드 후 새 commit 이 들어왔으면, 이전 지적이 새 commit 으로 처리됐는지",
+        "     diff 와 history 를 비교해 평가하고, 처리됐으면 다시 flag 하지 마라.",
+        "",
+    ]
+    return "\n".join(header_lines + list(rendered))
+
+
+def _format_review_history_item(c: ReviewComment) -> str:
+    body = c.body.strip()
+    if len(body) > _HISTORY_PER_COMMENT_CAP:
+        body = body[:_HISTORY_PER_COMMENT_CAP] + "…(이하 생략)"
+    location = ""
+    if c.kind == "inline":
+        # `comment_id` 가 메타리플라이 타깃이라 명시 노출. 모델이 그대로 회수해야 하므로
+        # 정수 그대로 (인용 X).
+        location = (
+            f" (comment_id={c.comment_id}, path={c.path}, line={c.line})"
+        )
+    # Prompt injection 방어 (codex PR #24 후속 라운드 Major):
+    # 모든 줄에 `> ` prefix (markdown blockquote) 를 붙여 외부 작성자 / 봇 코멘트
+    # 본문이 `=== FILES ===`, 출력 스키마, 지시문 등 prompt 최상위 텍스트로 해석될
+    # 가능성을 차단. 첫 줄만 들여쓰기 (`f"  {body}"`) 하던 이전 구현은 multiline
+    # 본문의 2번째 줄부터 그대로 노출됐다.
+    quoted = textwrap.indent(body, "> ", lambda _line: True)
+    return (
+        f"[{c.kind}] {c.created_at.isoformat()} @{c.author_login}{location}\n"
+        f"{quoted}\n"
+    )

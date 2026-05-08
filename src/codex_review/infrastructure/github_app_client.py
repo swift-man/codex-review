@@ -17,7 +17,9 @@ from codex_review.domain import (
     Finding,
     PullRequest,
     RepoRef,
+    ReviewComment,
     ReviewEvent,
+    ReviewHistory,
     ReviewResult,
     ReviewThread,
 )
@@ -347,6 +349,138 @@ class GitHubAppClient:
             )
         return tuple(out)
 
+    async def fetch_review_history(
+        self, pr: PullRequest, installation_id: int
+    ) -> ReviewHistory:
+        """이전 PR 코멘트 / 리뷰 기록을 시간순으로 묶어 반환.
+
+        병렬 fetch 대상:
+          1. `GET /issues/{n}/comments` — PR 본문 아래 일반 코멘트
+          2. `GET /pulls/{n}/comments` — 라인에 붙은 inline review comment
+          3. `GET /pulls/{n}/reviews` — 다른 봇 / 사람 리뷰의 summary 본문
+
+        필터:
+          - `FOLLOWUP_MARKER` 가 박힌 우리 봇 자동 답글 제외 (메타 신호 노이즈).
+          - `body` 가 비어 있는 항목 제외.
+
+        정렬: `created_at` 오름차순 — 모델이 시간 흐름을 인지해 deferred / 처리완료
+        신호를 정확히 해석하도록.
+
+        구현 상수:
+          - 우리 봇 식별: `pr.repo` 단위 review_model_label 만 갖고는 본인 식별 못함.
+            대신 `is_our_bot=True` 플래그를 follow-up 마커 또는 `review_model_label`
+            footer 패턴으로 추정. footer 가 빈 코멘트라도 author 가 동일하면 True.
+
+        토큰 한계 / 페이지네이션: per_page=100, Link rel=next 추적. issue/inline 은
+        많아질 수 있어 페이지네이션 필수. reviews 는 보통 적지만 동일 패턴.
+        """
+        token = await self.get_installation_token(installation_id)
+        repo_pulls = f"/repos/{pr.repo.full_name}/pulls/{pr.number}"
+        repo_issue = f"/repos/{pr.repo.full_name}/issues/{pr.number}"
+
+        # 3개 엔드포인트 병렬 — 같은 PR 의 독립 리소스라 race 없음.
+        # `asyncio.gather(return_exceptions=True)` 로 graceful degradation (gemini PR
+        # #24 Critical+Major+DIP 후속 라운드):
+        #   - 한 엔드포인트 일시 장애 시 나머지 정상 데이터는 보존 (TaskGroup 은 형제
+        #     태스크 자동 취소라 통째 유실).
+        #   - `ExceptionGroup` 대신 일반 예외 객체 반환 → 호출자가 추가 catch 불필요.
+        #   - 인프라 계층이 자체적으로 부분 실패 처리 → 앱 계층은 httpx 등 인프라
+        #     라이브러리에 직접 의존하지 않음 (DIP 회복).
+        # `get_installation_token` 실패는 별도 — 토큰 없이는 어떤 엔드포인트도 못 가서
+        # 그대로 전파해야 한다 (애초에 다음 단계 review 자체도 진행 불가).
+        results = await asyncio.gather(
+            self._collect_pages(
+                f"{repo_issue}/comments?per_page=100", auth=f"token {token}"
+            ),
+            self._collect_pages(
+                f"{repo_pulls}/comments?per_page=100", auth=f"token {token}"
+            ),
+            self._collect_pages(
+                f"{repo_pulls}/reviews?per_page=100", auth=f"token {token}"
+            ),
+            return_exceptions=True,
+        )
+        endpoint_labels = ("issues/comments", "pulls/comments", "pulls/reviews")
+        issue_items, inline_items, review_items = (
+            self._extract_history_page(label, result, pr)
+            for label, result in zip(endpoint_labels, results, strict=True)
+        )
+
+        comments: list[ReviewComment] = []
+        comments.extend(_parse_issue_comments(issue_items))
+        comments.extend(_parse_inline_comments(inline_items))
+        comments.extend(_parse_review_summaries(review_items))
+
+        # 정렬 후 다시 튜플로. created_at 동률은 안정 정렬로 입력 순서 유지.
+        comments.sort(key=lambda c: c.created_at)
+        return ReviewHistory(comments=tuple(comments))
+
+    def _extract_history_page(
+        self, label: str, result: object, pr: PullRequest
+    ) -> list[Any]:
+        """gather 결과 1건 → 항목 리스트. 예외였으면 경고 로그 + 빈 리스트로 강등.
+
+        부분 실패 graceful degradation — 한 엔드포인트가 일시 장애여도 나머지 정상
+        데이터로 history 컨텍스트를 채운다.
+        """
+        if isinstance(result, BaseException):
+            logger.warning(
+                "fetch_review_history: %s endpoint failed for %s#%d — "
+                "proceeding with partial data",
+                label, pr.repo.full_name, pr.number,
+                exc_info=result,
+            )
+            return []
+        if isinstance(result, list):
+            return result
+        # _collect_pages 가 dict 등 비정상 응답을 반환한 케이스 (이론상 없지만 방어).
+        return []
+
+    async def _collect_pages(self, url_or_path: str, *, auth: str) -> list[Any]:
+        """`Link rel=next` 따라 끝까지 순회하며 모든 페이지 항목을 평탄화해 반환.
+
+        Safety cap (gemini PR #24 Major): GitHub 가 잘못된 Link 헤더를 반환하거나
+        악의적 / 비정상적으로 코멘트 수가 매우 많은 PR 에서 무한 루프 / OOM /
+        secondary rate limit 초과를 막기 위해 100 페이지 (=10K 항목, per_page=100)
+        까지만 순회. GraphQL `list_review_threads` 쪽 페이지네이션과 동일한 cap.
+
+        Mid-page partial preservation (gemini PR #24 후속 라운드 Minor): 후반부
+        페이지에서 httpx.HTTPError / OSError / TimeoutError 가 발생하면 이전까지
+        성공적으로 모은 페이지 데이터까지 통째 유실되던 문제 해소. 예외를 try/except
+        로 잡고 break — 그 시점까지 수집된 항목은 반환되고 호출자는 graceful
+        degradation 으로 부분 데이터를 활용. 알 수 없는 예외 (파싱 버그 등) 는
+        그대로 전파해 진짜 결함을 숨기지 않는다.
+        """
+        out: list[Any] = []
+        next_url: str | None = url_or_path
+        for _ in range(100):
+            if not next_url:
+                break
+            try:
+                page, next_url = await self._get_page_with_next(next_url, auth=auth)
+            except (httpx.HTTPError, OSError, TimeoutError):
+                # 일시 장애 — 부분 데이터 보존 후 종료. 호출자 (fetch_review_history)
+                # 의 gather(return_exceptions=True) 가 결과 리스트로 받으므로 다른
+                # 엔드포인트의 정상 데이터는 유지.
+                logger.warning(
+                    "_collect_pages: transient failure mid-pagination for %s "
+                    "— preserving %d items collected so far",
+                    url_or_path, len(out),
+                )
+                break
+            if isinstance(page, list):
+                out.extend(page)
+            else:
+                # 비정상 응답 (dict 등) 은 무시하고 종료.
+                break
+        else:
+            # `for ... else` — break 없이 한도 도달 시 실행. 정상 PR 은 절대 도달 X.
+            logger.warning(
+                "REST pagination exceeded safety cap (100 pages) for %s",
+                url_or_path,
+            )
+        return out
+
     async def reply_to_review_comment(
         self, pr: PullRequest, comment_id: int, body: str
     ) -> None:
@@ -569,6 +703,122 @@ def _parse_review_thread(raw: dict[str, Any]) -> ReviewThread | None:
         has_non_root_author_reply=has_other_author,
         has_followup_marker=has_followup_marker,
     )
+
+
+# --- Review history parsers ------------------------------------------------
+# `fetch_review_history` 가 받은 GitHub REST 응답 (issue / inline / review summaries)
+# 을 도메인 `ReviewComment` 시퀀스로 변환. 각 종류의 GitHub 스키마가 다르므로 별도
+# 헬퍼로 분리. 본문이 비어 있거나 우리 follow-up marker 가 박힌 자동 답글은 제외.
+
+
+def _parse_iso_datetime(value: object) -> datetime | None:
+    """`"2025-01-02T03:04:05Z"` 같은 ISO 8601 → tz-aware datetime (UTC). 실패 시 None.
+
+    `datetime.fromisoformat` 은 Python 3.11+ 에서 `Z` 접미사를 인식해 `tzinfo=UTC` 가
+    설정된 aware datetime 을 반환한다 (이전 주석은 "naive" 라고 잘못 적혀 있었음).
+    호출자는 시간 비교 / 정렬에 그대로 사용하면 된다 — 다른 aware 객체와 무리 없이
+    비교됨.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    with contextlib.suppress(ValueError):
+        return datetime.fromisoformat(value)
+    return None
+
+
+def _is_our_followup_marker(body: str) -> bool:
+    """우리 봇의 자동 답글에는 `FOLLOWUP_MARKER` 가 박혀 있다. history 에서 제외해
+    메타 신호 노이즈를 차단."""
+    return FOLLOWUP_MARKER in body
+
+
+def _parse_issue_comments(items: list[Any]) -> list[ReviewComment]:
+    """`GET /issues/{n}/comments` 응답 항목 → 도메인 `ReviewComment(kind="issue")`."""
+    out: list[ReviewComment] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        body = str(raw.get("body") or "").strip()
+        if not body or _is_our_followup_marker(body):
+            continue
+        login = str(((raw.get("user") or {}).get("login")) or "")
+        created = _parse_iso_datetime(raw.get("created_at"))
+        if created is None:
+            continue
+        out.append(ReviewComment(
+            author_login=login,
+            kind="issue",
+            body=body,
+            created_at=created,
+        ))
+    return out
+
+
+def _parse_inline_comments(items: list[Any]) -> list[ReviewComment]:
+    """`GET /pulls/{n}/comments` 응답 항목 → 도메인 `ReviewComment(kind="inline")`.
+
+    inline 은 메타리플라이 타깃이라 `comment_id` (REST `id`) 보존 필수. path/line 도
+    사용 가능한 경우 함께.
+    """
+    out: list[ReviewComment] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        body = str(raw.get("body") or "").strip()
+        if not body or _is_our_followup_marker(body):
+            continue
+        login = str(((raw.get("user") or {}).get("login")) or "")
+        created = _parse_iso_datetime(raw.get("created_at"))
+        if created is None:
+            continue
+        comment_id = raw.get("id")
+        comment_id_int = comment_id if isinstance(comment_id, int) else None
+        path = raw.get("path")
+        path_str = str(path) if isinstance(path, str) else None
+        # `line` 이 None 이면 outdated 처리된 댓글 — line 정보 없이 보존.
+        raw_line = raw.get("line")
+        line = raw_line if isinstance(raw_line, int) else None
+        # `in_reply_to_id` 가 있으면 대댓글 — 메타리플라이 대상에서 제외해야 한다
+        # (codex PR #24 후속 라운드 Major). 루트 inline 에만 답글을 다는 게 GitHub
+        # API 와 PR 의도 양쪽에 부합.
+        is_reply = raw.get("in_reply_to_id") is not None
+        out.append(ReviewComment(
+            author_login=login,
+            kind="inline",
+            body=body,
+            created_at=created,
+            comment_id=comment_id_int,
+            path=path_str,
+            line=line,
+            is_reply=is_reply,
+        ))
+    return out
+
+
+def _parse_review_summaries(items: list[Any]) -> list[ReviewComment]:
+    """`GET /pulls/{n}/reviews` 응답 → 도메인 `ReviewComment(kind="review-summary")`.
+
+    review summary 본문이 비어 있는 경우 (예: APPROVED 만 박고 본문 없는 케이스) 는
+    history 에 노이즈만 추가하므로 제외. submitted_at 을 created_at 으로 사용.
+    """
+    out: list[ReviewComment] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        body = str(raw.get("body") or "").strip()
+        if not body or _is_our_followup_marker(body):
+            continue
+        login = str(((raw.get("user") or {}).get("login")) or "")
+        created = _parse_iso_datetime(raw.get("submitted_at") or raw.get("created_at"))
+        if created is None:
+            continue
+        out.append(ReviewComment(
+            author_login=login,
+            kind="review-summary",
+            body=body,
+            created_at=created,
+        ))
+    return out
 
 
 __all__ = ["FOLLOWUP_MARKER", "GitHubAppClient", "ReviewEvent", "_default_tls_context"]

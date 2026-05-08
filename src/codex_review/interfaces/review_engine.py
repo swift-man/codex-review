@@ -1,10 +1,23 @@
 from typing import Protocol
 
-from codex_review.domain import FileDump, PullRequest, ReviewResult
+from codex_review.domain import FileDump, PullRequest, ReviewHistory, ReviewResult
 
 
 class ReviewEngine(Protocol):
-    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult: ...
+    async def review(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+        *,
+        history: ReviewHistory | None = None,
+    ) -> ReviewResult:
+        """리뷰를 수행해 도메인 `ReviewResult` 반환.
+
+        `history` 가 None 또는 빈 컬렉션이면 prompt 의 history 섹션을 생략 — 첫 리뷰
+        호환성. 이전 라운드의 코멘트 / 다른 봇 의견이 있으면 prompt 에 직렬화해 모델
+        이 동일 항목 반복 지적 / deferred 무시를 피하도록.
+        """
+        ...
 
 
 class ReviewEngineError(RuntimeError):

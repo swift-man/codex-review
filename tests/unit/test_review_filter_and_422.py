@@ -70,6 +70,10 @@ class _CapturingGitHub:
     async def get_installation_token(self, installation_id: int) -> str:
         return "tkn"
 
+    async def fetch_review_history(self, pr, installation_id):
+        from codex_review.domain import ReviewHistory
+        return ReviewHistory()
+
 
 class _NoopFetcher:
     @asynccontextmanager
@@ -93,7 +97,7 @@ class _StaticEngine:
     def __init__(self, result: ReviewResult) -> None:
         self._result = result
 
-    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    async def review(self, pr, dump, *, history=None) -> ReviewResult:
         return self._result
 
 

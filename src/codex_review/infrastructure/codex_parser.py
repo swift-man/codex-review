@@ -4,13 +4,17 @@ import json
 import logging
 import re
 
-from codex_review.domain import Finding, ReviewEvent, ReviewResult
+from codex_review.domain import Finding, MetaReply, ReviewEvent, ReviewResult
 from codex_review.domain.finding import (
     SEVERITY_CRITICAL,
     SEVERITY_MINOR,
     SEVERITY_SUGGESTION,
     VALID_SEVERITIES,
 )
+
+# 메타리플라이는 노이즈 차단을 위해 한 라운드에 1건만 허용. 모델이 더 많이 산출해도
+# 첫 항목만 채택하고 로그만 남긴다 (작성자 정책: "대댓글은 1개면 될 것 같다").
+_META_REPLY_MAX = 1
 
 # 레거시 값 → 새 4단계 매핑. 이전 프롬프트가 "must_fix"/"suggest" 만 쓰던 시기의
 # 응답도 무해하게 받아들이기 위함 — 신규 프롬프트 배포 직후 쌓여 있던 작업 큐 방어.
@@ -27,7 +31,55 @@ _LEGACY_SEVERITY_ALIASES: dict[str, str] = {
 
 logger = logging.getLogger(__name__)
 
-_JSON_BLOCK = re.compile(r"\{(?:[^{}]|\{[^{}]*\})*\}", re.DOTALL)
+
+def _find_json_blocks(text: str) -> list[str]:
+    """텍스트에서 균형 잡힌 `{...}` 블록을 추출 (JSON string quote 인식).
+
+    이전 구현은 정규식 `\\{(?:[^{}]|\\{[^{}]*\\})*\\}` 으로 1단계 중첩까지만 매칭했다.
+    모델이 본문 코드 스니펫에 다단 중첩 (`{ foo: { bar } }`) 을 출력하면 매칭 실패해
+    유효한 JSON 응답이 plain text fallback 으로 강등되는 위험 (gemini PR #24 후속
+    라운드 Major).
+
+    이 헬퍼는 brace counting 으로 임의 깊이 중첩을 처리하고, 동시에 JSON string
+    리터럴 안의 `{` `}` 를 무시한다. `\\` escape 도 인식.
+    """
+    blocks: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        # `{` 발견 — 균형 매칭 시도.
+        start = i
+        depth = 0
+        in_string = False
+        escape = False
+        while i < n:
+            ch = text[i]
+            if escape:
+                escape = False
+            elif in_string:
+                if ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        blocks.append(text[start:i + 1])
+                        i += 1
+                        break
+            i += 1
+        else:
+            # 균형 안 맞음 — 더 이상 후보 없음.
+            break
+    return blocks
 
 
 def parse_review(raw: str) -> ReviewResult:
@@ -78,7 +130,43 @@ def parse_review(raw: str) -> ReviewResult:
             _sanitize_body(v) for v in _as_str_list(payload.get("improvements"))
         ),
         findings=findings,
+        meta_replies=tuple(_parse_meta_replies(payload.get("meta_replies"))),
     )
+
+
+def _parse_meta_replies(raw: object) -> list[MetaReply]:
+    """모델이 산출한 `meta_replies` 배열 → `MetaReply` 시퀀스.
+
+    최대 `_META_REPLY_MAX` (=1) 건만 채택. 그 이상은 노이즈 방지를 위해 drop 하고
+    로그로만 남긴다. body 가 비어 있거나 comment_id 가 정수가 아닌 항목은 스킵.
+
+    `body` 도 `_sanitize_body` 로 통과시켜 dict-repr 누출을 메타리플라이 경로에서도
+    동일하게 차단.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[MetaReply] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        # LLM 이 종종 JSON 숫자를 문자열로 환각 (예: "12345") 시 `isinstance(int)`
+        # 만 검사하면 valid 응답 유실. `_coerce_line` 이 정확히 같은 계약 — 양수
+        # 정수 또는 `isdigit()` 인 문자열만 허용 — 이라 재사용 (gemini PR #24
+        # 후속 라운드 Major).
+        comment_id = _coerce_line(item.get("reply_to_comment_id"))
+        if comment_id is None:
+            continue
+        body = _sanitize_body(str(item.get("body") or "").strip())
+        if not body:
+            continue
+        out.append(MetaReply(reply_to_comment_id=comment_id, body=body))
+    if len(out) > _META_REPLY_MAX:
+        logger.info(
+            "model returned %d meta_replies — capping to %d (using model's own ordering: first item kept)",
+            len(out), _META_REPLY_MAX,
+        )
+        out = out[:_META_REPLY_MAX]
+    return out
 
 
 def _extract_json(text: str) -> dict[str, object] | None:
@@ -95,7 +183,7 @@ def _extract_json(text: str) -> dict[str, object] | None:
     # Codex agentic 실행은 "추론 → 최종 답" 순서로 여러 JSON 조각을 내뱉을 수 있다.
     # 예: 중간에 `{"note": "..."}` 같은 로그 성격의 JSON 이 섞여도 최종 리뷰 JSON 은 맨 뒤.
     # 따라서 뒤에서부터 훑으며 "summary" 키를 가진 첫 후보를 리뷰 결과로 채택한다.
-    candidates = _JSON_BLOCK.findall(text)
+    candidates = _find_json_blocks(text)
     for candidate in reversed(candidates):
         # 후보 하나가 JSON 이 아니면 다음 후보로 넘어간다 — JSONDecodeError 는 의도적으로 삼킨다.
         with contextlib.suppress(json.JSONDecodeError, RecursionError):

@@ -720,3 +720,171 @@ def test_parse_preserves_approve_with_zero_findings() -> None:
     }
     """
     assert parse_review(raw).event == ReviewEvent.APPROVE
+
+
+# ---------------------------------------------------------------------------
+# meta_replies 파싱 — 다른 봇 inline comment 에 대한 대댓글
+# ---------------------------------------------------------------------------
+
+
+def test_parse_meta_replies_extracts_single_item() -> None:
+    """모델이 산출한 메타리플라이 1건이 도메인 객체로 추출되는지."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "meta_replies": [
+        {"reply_to_comment_id": 12345, "body": "다른 봇 phantom 지적 — 실제 코드에 그 패턴 없음."}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert len(result.meta_replies) == 1
+    m = result.meta_replies[0]
+    assert m.reply_to_comment_id == 12345
+    assert "phantom" in m.body
+
+
+def test_parse_meta_replies_caps_at_one_when_model_oversharing() -> None:
+    """노이즈 차단을 위해 모델이 여러 건 보내도 첫 항목 1건만 채택."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "meta_replies": [
+        {"reply_to_comment_id": 1, "body": "동의"},
+        {"reply_to_comment_id": 2, "body": "또 다른 동의"},
+        {"reply_to_comment_id": 3, "body": "세 번째"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert len(result.meta_replies) == 1
+    assert result.meta_replies[0].reply_to_comment_id == 1
+
+
+def test_parse_meta_replies_skips_invalid_items() -> None:
+    """comment_id 누락 / 음수 / body 빈 문자열은 스킵."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "meta_replies": [
+        {"reply_to_comment_id": "abc", "body": "string id 무효"},
+        {"reply_to_comment_id": -1, "body": "음수 무효"},
+        {"reply_to_comment_id": 99, "body": ""},
+        {"reply_to_comment_id": 100, "body": "정상"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert len(result.meta_replies) == 1
+    assert result.meta_replies[0].reply_to_comment_id == 100
+
+
+def test_parse_meta_replies_empty_when_field_missing() -> None:
+    """meta_replies 필드가 없으면 빈 튜플 — 첫 리뷰 호환성."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE"
+    }
+    """
+    assert parse_review(raw).meta_replies == ()
+
+
+def test_parse_meta_replies_sanitizes_dict_repr_in_body() -> None:
+    """body 가 dict repr 이면 _sanitize_body 가 통과 — 누출 차단 일관성 유지."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "meta_replies": [
+        {"reply_to_comment_id": 99, "body": "{'message': '실제 응답 텍스트'}"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert len(result.meta_replies) == 1
+    assert result.meta_replies[0].body == "실제 응답 텍스트"
+
+
+def test_parse_meta_replies_coerces_string_id_to_int() -> None:
+    """회귀 (gemini PR #24 후속 라운드 Major): LLM 이 JSON 숫자를 문자열로 환각해도
+    (예: "12345") `_coerce_line` 패턴으로 string→int coerce 해 valid 응답 유실 방지.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "meta_replies": [
+        {"reply_to_comment_id": "12345", "body": "string-as-int 환각도 통과"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert len(result.meta_replies) == 1
+    assert result.meta_replies[0].reply_to_comment_id == 12345
+
+
+def test_parse_meta_replies_rejects_non_digit_string_id() -> None:
+    """isdigit() 통과 못 하는 string 은 여전히 drop — 환각 / 변조 방어."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "meta_replies": [
+        {"reply_to_comment_id": "abc12345", "body": "비숫자 string drop"},
+        {"reply_to_comment_id": "0", "body": "0 / 음수 drop (양수만 허용)"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.meta_replies == ()
+
+
+def test_extract_json_handles_deeply_nested_braces_in_string() -> None:
+    """회귀 (gemini PR #24 후속 라운드 Major): 모델 본문 코드 스니펫이 다단 중첩
+    중괄호를 포함해도 brace-counting 파서가 균형 매칭으로 outer JSON 을 정확히 추출.
+    이전 정규식 (`\\{(?:[^{}]|\\{[^{}]*\\})*\\}`) 은 1단계 중첩까지만 허용해 다단 중첩
+    시 매칭 실패로 응답 전체가 plain text fallback 으로 강등됐다.
+    """
+    raw = (
+        "사고 과정:\n"
+        '아래 코드를 보세요: function() { return { foo: { bar: 1 } }; }\n'
+        '\nFinal:\n'
+        '{"summary": "최종", "event": "COMMENT", '
+        '"comments": [{"path": "x.py", "line": 1, "severity": "minor", '
+        '"body": "코드 예시: function() { return { foo: { bar: 1 } }; }"}]}'
+    )
+    result = parse_review(raw)
+    # outer JSON 이 정확히 추출 + 파싱돼 finding 1건이 살아남아야 한다.
+    assert result.summary == "최종"
+    assert len(result.findings) == 1
+    assert result.findings[0].path == "x.py"
+    # body 안의 nested 중괄호도 보존.
+    assert "function()" in result.findings[0].body
+
+
+def test_extract_json_ignores_braces_inside_json_strings() -> None:
+    """JSON string literal 안의 `{` `}` 는 균형 매칭에서 무시돼야 한다 — 그래야 string
+    안에 brace 가 있어도 outer 경계가 정확히 잡힌다.
+    """
+    raw = (
+        '추론...\n'
+        '{"summary": "여는 중괄호 } 닫는 중괄호 만 있는 string", '
+        '"event": "APPROVE"}'
+    )
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.APPROVE
+    assert "string" in result.summary
+
+
+def test_extract_json_handles_escaped_quotes_in_strings() -> None:
+    """JSON string 안의 escape 처리된 quote (`\\"`) 는 string 종료가 아니므로 brace
+    스캐너가 string 모드에서 빠져 나오면 안 된다.
+    """
+    raw = '{"summary": "escape \\" 다음 { 무시 }", "event": "COMMENT"}'
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.COMMENT
+    assert "escape" in result.summary

@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from codex_review.domain import FileDump, PullRequest, ReviewResult
+from codex_review.domain import FileDump, PullRequest, ReviewHistory, ReviewResult
 from codex_review.interfaces import ReviewEngineError
 from codex_review.logging_utils import redact_text
 
@@ -71,8 +71,14 @@ class CodexCliEngine:
             )
         return combined.splitlines()[0] if combined else "Logged in"
 
-    async def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
-        prompt = build_prompt(pr, dump)
+    async def review(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+        *,
+        history: ReviewHistory | None = None,
+    ) -> ReviewResult:
+        prompt = build_prompt(pr, dump, history=history)
         # "-" positional 은 codex exec 에 stdin 에서 프롬프트를 읽으라는 지시.
         # argv 로 넘기면 전체 레포 덤프가 ARG_MAX 를 초과할 수 있어 stdin 이 안전.
         logger.info(
