@@ -1391,11 +1391,12 @@ async def test_use_case_accepts_empty_history_from_infra_after_total_failure() -
 async def test_use_case_posts_meta_replies_after_review() -> None:
     """모델이 메타리플라이 1건 산출 → review post 후 reply_to_review_comment 호출.
 
-    history 에 comment_id=42 인 inline 코멘트가 있어 allowlist 검증 통과.
+    history 에 comment_id=42 인 다른 봇 inline 코멘트 + `bot_login` 주입 → allowlist
+    검증 통과.
     """
     history = ReviewHistory(comments=(
         ReviewComment(
-            author_login="gemini-pr-review-bot[bot]",
+            author_login="gemini-pr-review-bot[bot]",  # 다른 봇
             kind="inline",
             body="phantom?",
             created_at=_dt(2026, 5, 1),
@@ -1420,6 +1421,7 @@ async def test_use_case_posts_meta_replies_after_review() -> None:
         file_collector=_StaticFullCollector(dump=full_dump),
         engine=engine,
         max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",  # 자기 봇 식별 — 메타리플라이 활성 조건
     )
 
     await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
@@ -1452,7 +1454,8 @@ async def test_use_case_skips_meta_reply_post_when_none() -> None:
 async def test_use_case_drops_meta_reply_with_id_outside_history_allowlist() -> None:
     """회귀 (codex PR #24 Major): 모델 환각 / prompt injection 으로 history 에 없는
     comment_id 가 메타리플라이로 들어오면 drop. 보안 — 엉뚱한 thread 에 봇 답글 게시
-    경로 차단.
+    경로 차단. bot_login 주입해 self-exclusion 정책으로 drop 되는 게 아니라 ID 불일치
+    로 drop 됨을 명확히 한다.
     """
     history = ReviewHistory(comments=(
         ReviewComment(
@@ -1482,6 +1485,7 @@ async def test_use_case_drops_meta_reply_with_id_outside_history_allowlist() -> 
         file_collector=_StaticFullCollector(dump=full_dump),
         engine=engine,
         max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",
     )
 
     await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
@@ -1521,6 +1525,7 @@ async def test_use_case_drops_meta_reply_targeting_non_inline_history() -> None:
         file_collector=_StaticFullCollector(dump=full_dump),
         engine=engine,
         max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",
     )
 
     await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
@@ -1561,6 +1566,7 @@ async def test_use_case_drops_meta_reply_targeting_human_inline_comment() -> Non
         file_collector=_StaticFullCollector(dump=full_dump),
         engine=engine,
         max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",
     )
 
     await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
@@ -1609,5 +1615,92 @@ async def test_use_case_drops_meta_reply_targeting_self_bot() -> None:
     await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
 
     # 자기 봇 inline 이라 drop. 메인 review 는 정상 게시.
+    assert github.replies == []
+    assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_disables_meta_replies_when_bot_login_unknown() -> None:
+    """회귀 (codex PR #24 후속 라운드 Major): `bot_login=None` (GITHUB_APP_SLUG 미설정)
+    이면 자기 봇 식별이 불가능 → 메타리플라이 자체를 비활성화. 그래야 자기 코멘트에
+    답글 다는 경로를 안전 우선으로 차단할 수 있다.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",  # 다른 봇이라도
+            kind="inline",
+            body="다른 봇 의견",
+            created_at=_dt(2026, 5, 1),
+            comment_id=400,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        meta_replies=(MetaReply(reply_to_comment_id=400, body="응답"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        # bot_login 미주입 — None
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # bot_login None → 메타리플라이 비활성화. 다른 봇 inline 이라도 reply 안 감.
+    assert github.replies == []
+    # 메인 리뷰는 정상 게시.
+    assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_self_exclusion_is_case_insensitive() -> None:
+    """회귀 (gemini PR #24 후속 라운드 Minor): GitHub `author_login` 의 대소문자
+    차이로 self-exclusion 이 우회되면 안 된다. `casefold()` 비교로 대소문자 무관하게
+    자기 봇 인식.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            # 운영자 설정과 GitHub API 응답의 대소문자가 다른 케이스 시뮬.
+            author_login="Codex-Review-Bot[bot]",
+            kind="inline",
+            body="자기 봇 코멘트 (대문자 변형)",
+            created_at=_dt(2026, 5, 1),
+            comment_id=500,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        meta_replies=(MetaReply(reply_to_comment_id=500, body="대소문자 우회 시도"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        # 운영자가 설정한 정규화 결과는 모두 소문자.
+        bot_login="codex-review-bot[bot]",
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # 대소문자 다르지만 casefold() 로 동일 인식 → drop.
     assert github.replies == []
     assert len(github.posted_reviews) == 1

@@ -144,18 +144,25 @@ class ReviewPullRequestUseCase:
         """
         # history 의 inline 코멘트 id 집합 — 단 **다른 봇 작성** 코멘트만 허용:
         #   - bot suffix `[bot]` (사람 로그인 차단 — coderabbit PR #24 Major)
-        #   - 우리 봇 자신 제외 (codex / gemini PR #24 후속 라운드 Major+Minor):
-        #     allowlist 가 자기 봇도 허용하면 자기 답글에 자기 답글 다는 무한 루프
-        #     가능. `_bot_login` 이 설정돼 있으면 비교, None 이면 단순 suffix 만.
-        # issue / review-summary 는 thread 자체가 없어 메타리플라이 대상이 될 수
-        # 없으므로 원천 제외.
-        allowed_ids = {
-            c.comment_id for c in history.comments
-            if c.kind == "inline"
-            and c.comment_id is not None
-            and c.author_login.endswith("[bot]")
-            and c.author_login != self._bot_login
-        }
+        #   - 우리 봇 자신 제외 (codex / gemini PR #24 후속 라운드 Major):
+        #     allowlist 가 자기 봇도 허용하면 자기 답글에 자기 답글 다는 무한 루프 가능.
+        #
+        # 자기 봇 식별이 불가능하면 (`_bot_login is None`) 메타리플라이 자체를 비활성화
+        # — `GITHUB_APP_SLUG` 미설정 운영 환경에서 우리가 자기 댓글을 골라도 막을 방법이
+        # 없기 때문에 안전 우선 정책 (codex PR #24 후속 라운드 Major). `casefold()` 비교
+        # 로 author_login 대소문자 차이로 우회되는 엣지 케이스 방어 (gemini Minor).
+        # issue / review-summary 는 thread 자체가 없어 원천 제외.
+        if self._bot_login is None:
+            allowed_ids: set[int] = set()
+        else:
+            self_login_cf = self._bot_login.casefold()
+            allowed_ids = {
+                c.comment_id for c in history.comments
+                if c.kind == "inline"
+                and c.comment_id is not None
+                and c.author_login.endswith("[bot]")
+                and c.author_login.casefold() != self_login_cf
+            }
         validated: list[MetaReply] = []
         for m in result.meta_replies:
             if m.reply_to_comment_id not in allowed_ids:
