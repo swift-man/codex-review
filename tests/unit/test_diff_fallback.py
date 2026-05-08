@@ -1568,3 +1568,46 @@ async def test_use_case_drops_meta_reply_targeting_human_inline_comment() -> Non
     # 사람 inline 이라 drop. 메인 review 는 정상 게시.
     assert github.replies == []
     assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_drops_meta_reply_targeting_self_bot() -> None:
+    """회귀 (codex+gemini PR #24 후속 라운드 Major+Minor): allowlist 가 자기 봇도
+    허용하면 자기 코멘트에 자기 답글 다는 무한 루프 가능성. `bot_login` 이 주입되면
+    동일 author 는 allowlist 에서 제외돼야 한다.
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="codex-review-bot[bot]",  # 우리 봇 자신
+            kind="inline",
+            body="우리 봇이 단 이전 라운드 코멘트",
+            created_at=_dt(2026, 5, 1),
+            comment_id=300,
+            path="x.py",
+            line=1,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 300 은 [bot] suffix 통과하지만 self-exclusion 으로 drop.
+        meta_replies=(MetaReply(reply_to_comment_id=300, body="자기 답글"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",  # self-exclusion 활성화
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # 자기 봇 inline 이라 drop. 메인 review 는 정상 게시.
+    assert github.replies == []
+    assert len(github.posted_reviews) == 1

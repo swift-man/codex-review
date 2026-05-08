@@ -1,3 +1,4 @@
+import textwrap
 from collections import deque
 
 from codex_review.domain import (
@@ -489,7 +490,13 @@ def _format_review_history_item(c: ReviewComment) -> str:
         location = (
             f" (comment_id={c.comment_id}, path={c.path}, line={c.line})"
         )
+    # Prompt injection 방어 (codex PR #24 후속 라운드 Major):
+    # 모든 줄에 `> ` prefix (markdown blockquote) 를 붙여 외부 작성자 / 봇 코멘트
+    # 본문이 `=== FILES ===`, 출력 스키마, 지시문 등 prompt 최상위 텍스트로 해석될
+    # 가능성을 차단. 첫 줄만 들여쓰기 (`f"  {body}"`) 하던 이전 구현은 multiline
+    # 본문의 2번째 줄부터 그대로 노출됐다.
+    quoted = textwrap.indent(body, "> ", lambda _line: True)
     return (
         f"[{c.kind}] {c.created_at.isoformat()} @{c.author_login}{location}\n"
-        f"  {body}\n"
+        f"{quoted}\n"
     )

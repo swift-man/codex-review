@@ -807,3 +807,37 @@ def test_parse_meta_replies_sanitizes_dict_repr_in_body() -> None:
     result = parse_review(raw)
     assert len(result.meta_replies) == 1
     assert result.meta_replies[0].body == "실제 응답 텍스트"
+
+
+def test_parse_meta_replies_coerces_string_id_to_int() -> None:
+    """회귀 (gemini PR #24 후속 라운드 Major): LLM 이 JSON 숫자를 문자열로 환각해도
+    (예: "12345") `_coerce_line` 패턴으로 string→int coerce 해 valid 응답 유실 방지.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "meta_replies": [
+        {"reply_to_comment_id": "12345", "body": "string-as-int 환각도 통과"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert len(result.meta_replies) == 1
+    assert result.meta_replies[0].reply_to_comment_id == 12345
+
+
+def test_parse_meta_replies_rejects_non_digit_string_id() -> None:
+    """isdigit() 통과 못 하는 string 은 여전히 drop — 환각 / 변조 방어."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "meta_replies": [
+        {"reply_to_comment_id": "abc12345", "body": "비숫자 string drop"},
+        {"reply_to_comment_id": "0", "body": "0 / 음수 drop (양수만 허용)"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.meta_replies == ()

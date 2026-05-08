@@ -732,11 +732,6 @@ def _is_our_followup_marker(body: str) -> bool:
     return FOLLOWUP_MARKER in body
 
 
-def _is_bot_login(login: str) -> bool:
-    """GitHub App 본문 작성자는 `<slug>[bot]` 형태로 끝난다 — 사람 로그인에는 없는 패턴."""
-    return login.endswith("[bot]")
-
-
 def _parse_issue_comments(items: list[Any]) -> list[ReviewComment]:
     """`GET /issues/{n}/comments` 응답 항목 → 도메인 `ReviewComment(kind="issue")`."""
     out: list[ReviewComment] = []

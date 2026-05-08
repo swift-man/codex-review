@@ -42,6 +42,7 @@ class ReviewPullRequestUseCase:
         engine: ReviewEngine,
         max_input_tokens: int,
         diff_context_collector: DiffContextCollector | None = None,
+        bot_login: str | None = None,
     ) -> None:
         self._github = github
         self._repo_fetcher = repo_fetcher
@@ -51,6 +52,10 @@ class ReviewPullRequestUseCase:
         # None 이면 fallback 을 비활성화한다 (기존 동작: 예산 초과 시 리뷰 스킵).
         # 운영자가 명시적으로 옵트인 할 수 있도록 DI 경계에서 결정.
         self._diff_collector = diff_context_collector
+        # 우리 봇 자신의 GitHub login (예: `codex-review-bot[bot]`). 메타리플라이
+        # allowlist 에서 self-exclusion 에 사용. None 이면 self-exclusion 미적용
+        # (단순 bot suffix 검사) — 운영자가 GITHUB_APP_SLUG 를 설정해야만 활성화.
+        self._bot_login = bot_login
 
     async def execute(self, pr: PullRequest) -> None:
         token = await self._github.get_installation_token(pr.installation_id)
@@ -137,17 +142,19 @@ class ReviewPullRequestUseCase:
         파서 단에서 이미 `_META_REPLY_MAX=1` 로 제한되지만 방어적으로 try/except 로 묶어
         한 건 실패가 use case 흐름 (이미 review 게시 완료) 을 망치지 않게 한다.
         """
-        # history 의 inline 코멘트 id 집합 — 단 **봇 작성** 코멘트만 허용 (coderabbit
-        # PR #24 Major). PR 의 의도는 "다른 봇 의견에 대한 후속 답글" 이라, 모델이
-        # 사람 리뷰어의 inline ID 를 골라 사람 스레드에 봇이 답글 다는 경로를 차단.
-        # GitHub App 본문 작성자는 `<slug>[bot]` 형태로 끝나는 패턴 — 사람 로그인엔
-        # 없는 시그니처라 단순한 suffix 검사로 충분. issue / review-summary 는 thread 자
-        # 체가 없어 메타리플라이 대상이 될 수 없으므로 원천 제외.
+        # history 의 inline 코멘트 id 집합 — 단 **다른 봇 작성** 코멘트만 허용:
+        #   - bot suffix `[bot]` (사람 로그인 차단 — coderabbit PR #24 Major)
+        #   - 우리 봇 자신 제외 (codex / gemini PR #24 후속 라운드 Major+Minor):
+        #     allowlist 가 자기 봇도 허용하면 자기 답글에 자기 답글 다는 무한 루프
+        #     가능. `_bot_login` 이 설정돼 있으면 비교, None 이면 단순 suffix 만.
+        # issue / review-summary 는 thread 자체가 없어 메타리플라이 대상이 될 수
+        # 없으므로 원천 제외.
         allowed_ids = {
             c.comment_id for c in history.comments
             if c.kind == "inline"
             and c.comment_id is not None
             and c.author_login.endswith("[bot]")
+            and c.author_login != self._bot_login
         }
         validated: list[MetaReply] = []
         for m in result.meta_replies:

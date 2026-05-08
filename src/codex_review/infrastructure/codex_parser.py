@@ -101,8 +101,12 @@ def _parse_meta_replies(raw: object) -> list[MetaReply]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        comment_id = item.get("reply_to_comment_id")
-        if not isinstance(comment_id, int) or comment_id <= 0:
+        # LLM 이 종종 JSON 숫자를 문자열로 환각 (예: "12345") 시 `isinstance(int)`
+        # 만 검사하면 valid 응답 유실. `_coerce_line` 이 정확히 같은 계약 — 양수
+        # 정수 또는 `isdigit()` 인 문자열만 허용 — 이라 재사용 (gemini PR #24
+        # 후속 라운드 Major).
+        comment_id = _coerce_line(item.get("reply_to_comment_id"))
+        if comment_id is None:
             continue
         body = _sanitize_body(str(item.get("body") or "").strip())
         if not body:
