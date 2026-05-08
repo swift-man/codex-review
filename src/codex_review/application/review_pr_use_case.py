@@ -160,6 +160,7 @@ class ReviewPullRequestUseCase:
                 c.comment_id for c in history.comments
                 if c.kind == "inline"
                 and c.comment_id is not None
+                and not c.is_reply  # 루트 inline 만 — 대댓글에 또 답글 차단 (codex PR #24)
                 and c.author_login.endswith("[bot]")
                 and c.author_login.casefold() != self_login_cf
             }

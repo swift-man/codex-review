@@ -797,3 +797,42 @@ async def test_collect_pages_preserves_partial_data_on_mid_page_failure(
     # 1페이지의 정상 데이터는 보존돼야 한다 — 2페이지 장애로 통째 유실 X.
     assert len(history.comments) == 1
     assert history.comments[0].body == "page-1 정상"
+
+
+async def test_fetch_review_history_marks_reply_comments_with_is_reply_flag(
+    make_client,
+) -> None:
+    """회귀 (codex PR #24 후속 라운드 Major): `/pulls/{n}/comments` 응답의
+    `in_reply_to_id` 필드를 인식해 대댓글은 `ReviewComment.is_reply=True` 로 표시.
+    use case 단의 메타리플라이 allowlist 에서 대댓글을 정확히 거를 수 있다.
+    """
+    inline_payload = [
+        # 루트 inline — in_reply_to_id 없음
+        {"id": 100, "user": {"login": "gemini-pr-review-bot[bot]"},
+         "body": "원 지적", "path": "x.py", "line": 10,
+         "created_at": "2026-05-01T10:00:00Z"},
+        # 대댓글 — in_reply_to_id 가 100 을 가리킴
+        {"id": 101, "user": {"login": "gemini-pr-review-bot[bot]"},
+         "body": "대댓글", "path": "x.py", "line": 10,
+         "in_reply_to_id": 100,
+         "created_at": "2026-05-01T11:00:00Z"},
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        if path.endswith("/access_tokens"):
+            return httpx.Response(200, json={"token": "ITOK", "expires_at": "2030-01-01T00:00:00Z"})
+        if path.endswith("/pulls/42/comments"):
+            return httpx.Response(200, json=inline_payload)
+        return httpx.Response(200, json=[])
+
+    client = make_client(handler)
+    history = await client.fetch_review_history(_pr(), 7)
+
+    assert len(history.comments) == 2
+    # 시간순: 루트가 먼저, 대댓글이 두 번째.
+    root, reply = history.comments
+    assert root.comment_id == 100
+    assert root.is_reply is False
+    assert reply.comment_id == 101
+    assert reply.is_reply is True

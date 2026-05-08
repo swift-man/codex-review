@@ -841,3 +841,50 @@ def test_parse_meta_replies_rejects_non_digit_string_id() -> None:
     """
     result = parse_review(raw)
     assert result.meta_replies == ()
+
+
+def test_extract_json_handles_deeply_nested_braces_in_string() -> None:
+    """회귀 (gemini PR #24 후속 라운드 Major): 모델 본문 코드 스니펫이 다단 중첩
+    중괄호를 포함해도 brace-counting 파서가 균형 매칭으로 outer JSON 을 정확히 추출.
+    이전 정규식 (`\\{(?:[^{}]|\\{[^{}]*\\})*\\}`) 은 1단계 중첩까지만 허용해 다단 중첩
+    시 매칭 실패로 응답 전체가 plain text fallback 으로 강등됐다.
+    """
+    raw = (
+        "사고 과정:\n"
+        '아래 코드를 보세요: function() { return { foo: { bar: 1 } }; }\n'
+        '\nFinal:\n'
+        '{"summary": "최종", "event": "COMMENT", '
+        '"comments": [{"path": "x.py", "line": 1, "severity": "minor", '
+        '"body": "코드 예시: function() { return { foo: { bar: 1 } }; }"}]}'
+    )
+    result = parse_review(raw)
+    # outer JSON 이 정확히 추출 + 파싱돼 finding 1건이 살아남아야 한다.
+    assert result.summary == "최종"
+    assert len(result.findings) == 1
+    assert result.findings[0].path == "x.py"
+    # body 안의 nested 중괄호도 보존.
+    assert "function()" in result.findings[0].body
+
+
+def test_extract_json_ignores_braces_inside_json_strings() -> None:
+    """JSON string literal 안의 `{` `}` 는 균형 매칭에서 무시돼야 한다 — 그래야 string
+    안에 brace 가 있어도 outer 경계가 정확히 잡힌다.
+    """
+    raw = (
+        '추론...\n'
+        '{"summary": "여는 중괄호 } 닫는 중괄호 만 있는 string", '
+        '"event": "APPROVE"}'
+    )
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.APPROVE
+    assert "string" in result.summary
+
+
+def test_extract_json_handles_escaped_quotes_in_strings() -> None:
+    """JSON string 안의 escape 처리된 quote (`\\"`) 는 string 종료가 아니므로 brace
+    스캐너가 string 모드에서 빠져 나오면 안 된다.
+    """
+    raw = '{"summary": "escape \\" 다음 { 무시 }", "event": "COMMENT"}'
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.COMMENT
+    assert "escape" in result.summary

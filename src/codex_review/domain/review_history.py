@@ -37,6 +37,11 @@ class ReviewComment:
     comment_id: int | None = None
     path: str | None = None
     line: int | None = None
+    # GitHub `/pulls/{n}/comments` 응답에는 루트 inline 코멘트뿐 아니라 `in_reply_to_id`
+    # 가 있는 대댓글도 섞여 들어온다. 메타리플라이는 **루트 inline** 에만 의미가 있으므로
+    # (대댓글에 또 답글 달면 thread 가 무한히 늘어나거나 GitHub API 가 거부) allowlist
+    # 에서 대댓글을 걸러내려면 이 플래그가 필요. inline 외 종류에는 무관 — 항상 False.
+    is_reply: bool = False
 
 
 @dataclass(frozen=True)

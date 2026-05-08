@@ -1704,3 +1704,58 @@ async def test_use_case_self_exclusion_is_case_insensitive() -> None:
     # 대소문자 다르지만 casefold() 로 동일 인식 → drop.
     assert github.replies == []
     assert len(github.posted_reviews) == 1
+
+
+async def test_use_case_drops_meta_reply_targeting_a_reply_comment() -> None:
+    """회귀 (codex PR #24 후속 라운드 Major): GitHub `/pulls/{n}/comments` 응답에는
+    루트 inline 뿐 아니라 `in_reply_to_id` 가 있는 대댓글도 섞여 들어온다.
+    `is_reply=True` 항목은 allowlist 에서 제외돼 메타리플라이가 대댓글에 다시 달리지
+    않는다 (PR 의도: 다른 봇의 **원 지적** 에 메타응답).
+    """
+    history = ReviewHistory(comments=(
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",
+            kind="inline",
+            body="다른 봇의 원 지적 — 루트",
+            created_at=_dt(2026, 5, 1, 10, 0, 0),
+            comment_id=600,
+            path="x.py",
+            line=1,
+            is_reply=False,  # 루트
+        ),
+        ReviewComment(
+            author_login="gemini-pr-review-bot[bot]",
+            kind="inline",
+            body="대댓글 — in_reply_to_id 있음",
+            created_at=_dt(2026, 5, 1, 11, 0, 0),
+            comment_id=601,
+            path="x.py",
+            line=1,
+            is_reply=True,
+        ),
+    ))
+    github = _HistoryAwareGitHub(history=history)
+    engine = _HistoryEngine(result=ReviewResult(
+        summary="ok",
+        event=ReviewEvent.COMMENT,
+        # 601 (대댓글) 을 타깃 → drop. 600 (루트) 은 통과 가능했지만 모델이 안 골랐음.
+        meta_replies=(MetaReply(reply_to_comment_id=601, body="대댓글에 답글 시도"),),
+    ))
+    full_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1, mode=DUMP_MODE_FULL,
+    )
+    uc = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=_NoopFetcher(),
+        file_collector=_StaticFullCollector(dump=full_dump),
+        engine=engine,
+        max_input_tokens=10_000,
+        bot_login="codex-review-bot[bot]",
+    )
+
+    await uc.execute(_pr(changed=("a.py",), patches={"a.py": "@@ -1 +1 @@\n-x\n+y\n"}))
+
+    # 대댓글 ID drop. 메인 review 는 정상.
+    assert github.replies == []
+    assert len(github.posted_reviews) == 1

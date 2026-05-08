@@ -778,6 +778,10 @@ def _parse_inline_comments(items: list[Any]) -> list[ReviewComment]:
         # `line` 이 None 이면 outdated 처리된 댓글 — line 정보 없이 보존.
         raw_line = raw.get("line")
         line = raw_line if isinstance(raw_line, int) else None
+        # `in_reply_to_id` 가 있으면 대댓글 — 메타리플라이 대상에서 제외해야 한다
+        # (codex PR #24 후속 라운드 Major). 루트 inline 에만 답글을 다는 게 GitHub
+        # API 와 PR 의도 양쪽에 부합.
+        is_reply = raw.get("in_reply_to_id") is not None
         out.append(ReviewComment(
             author_login=login,
             kind="inline",
@@ -786,6 +790,7 @@ def _parse_inline_comments(items: list[Any]) -> list[ReviewComment]:
             comment_id=comment_id_int,
             path=path_str,
             line=line,
+            is_reply=is_reply,
         ))
     return out
 

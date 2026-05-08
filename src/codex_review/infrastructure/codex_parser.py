@@ -31,7 +31,55 @@ _LEGACY_SEVERITY_ALIASES: dict[str, str] = {
 
 logger = logging.getLogger(__name__)
 
-_JSON_BLOCK = re.compile(r"\{(?:[^{}]|\{[^{}]*\})*\}", re.DOTALL)
+
+def _find_json_blocks(text: str) -> list[str]:
+    """텍스트에서 균형 잡힌 `{...}` 블록을 추출 (JSON string quote 인식).
+
+    이전 구현은 정규식 `\\{(?:[^{}]|\\{[^{}]*\\})*\\}` 으로 1단계 중첩까지만 매칭했다.
+    모델이 본문 코드 스니펫에 다단 중첩 (`{ foo: { bar } }`) 을 출력하면 매칭 실패해
+    유효한 JSON 응답이 plain text fallback 으로 강등되는 위험 (gemini PR #24 후속
+    라운드 Major).
+
+    이 헬퍼는 brace counting 으로 임의 깊이 중첩을 처리하고, 동시에 JSON string
+    리터럴 안의 `{` `}` 를 무시한다. `\\` escape 도 인식.
+    """
+    blocks: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        # `{` 발견 — 균형 매칭 시도.
+        start = i
+        depth = 0
+        in_string = False
+        escape = False
+        while i < n:
+            ch = text[i]
+            if escape:
+                escape = False
+            elif in_string:
+                if ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        blocks.append(text[start:i + 1])
+                        i += 1
+                        break
+            i += 1
+        else:
+            # 균형 안 맞음 — 더 이상 후보 없음.
+            break
+    return blocks
 
 
 def parse_review(raw: str) -> ReviewResult:
@@ -135,7 +183,7 @@ def _extract_json(text: str) -> dict[str, object] | None:
     # Codex agentic 실행은 "추론 → 최종 답" 순서로 여러 JSON 조각을 내뱉을 수 있다.
     # 예: 중간에 `{"note": "..."}` 같은 로그 성격의 JSON 이 섞여도 최종 리뷰 JSON 은 맨 뒤.
     # 따라서 뒤에서부터 훑으며 "summary" 키를 가진 첫 후보를 리뷰 결과로 채택한다.
-    candidates = _JSON_BLOCK.findall(text)
+    candidates = _find_json_blocks(text)
     for candidate in reversed(candidates):
         # 후보 하나가 JSON 이 아니면 다음 후보로 넘어간다 — JSONDecodeError 는 의도적으로 삼킨다.
         with contextlib.suppress(json.JSONDecodeError, RecursionError):
