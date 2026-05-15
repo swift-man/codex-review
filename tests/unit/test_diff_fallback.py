@@ -117,8 +117,10 @@ class _StaticFullCollector:
 class _CapturingEngine:
     result: ReviewResult
     seen_dumps: list[FileDump] = field(default_factory=list)
+    seen_prs: list[PullRequest] = field(default_factory=list)
 
     async def review(self, pr: PullRequest, dump: FileDump, *, history=None) -> ReviewResult:
+        self.seen_prs.append(pr)
         self.seen_dumps.append(dump)
         return self.result
 
@@ -797,8 +799,66 @@ async def test_use_case_does_not_fall_back_when_only_filter_excluded_changed_fil
     # full 모드 그대로 리뷰돼야 하고, diff collector 는 호출되지 않아야 한다.
     assert len(engine.seen_dumps) == 1
     assert engine.seen_dumps[0].mode == DUMP_MODE_FULL
+    assert engine.seen_prs[0].changed_files == ("a.py",)
     _, posted = github.posted_reviews[0]
     assert "diff-only" not in posted.summary
+
+
+async def test_use_case_skips_when_all_changed_files_are_policy_excluded() -> None:
+    """`.reviewbot.yml` exclude 만으로 리뷰 대상 변경이 없으면 엔진 호출 자체를 생략한다."""
+    github = _CapturingGitHub()
+    filtered_dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x=1", size_bytes=3, is_changed=False),),
+        total_chars=3,
+        excluded=("README.md",),
+        exceeded_budget=False,
+        mode=DUMP_MODE_FULL,
+        filter_excluded=("README.md",),
+    )
+    engine_result = ReviewResult(summary="unused", event=ReviewEvent.COMMENT)
+    uc, engine = _use_case(github, filtered_dump, engine_result)
+    pr = _pr(changed=("README.md",), patches={"README.md": "@@\n+docs\n"})
+
+    await uc.execute(pr)
+
+    assert engine.seen_dumps == []
+    assert github.posted_reviews == []
+    assert github.posted_comments == []
+
+
+async def test_use_case_filters_diff_fallback_to_reviewable_changed_files() -> None:
+    github = _CapturingGitHub()
+    full_dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("Sources/App.swift", "README.md"),
+        exceeded_budget=True,
+        mode=DUMP_MODE_FULL,
+        filter_excluded=("README.md",),
+    )
+    engine_result = ReviewResult(summary="OK", event=ReviewEvent.COMMENT)
+    uc, engine = _use_case(github, full_dump, engine_result, max_tokens=10_000)
+    patches = {
+        "Sources/App.swift": "@@ -1 +1 @@\n-old\n+new\n",
+        "README.md": "@@ -1 +1 @@\n-old\n+new\n",
+    }
+    pr = _pr(
+        changed=("Sources/App.swift", "README.md"),
+        patches=patches,
+        diff_right={
+            "Sources/App.swift": frozenset({1}),
+            "README.md": frozenset({1}),
+        },
+    )
+
+    await uc.execute(pr)
+
+    assert len(engine.seen_dumps) == 1
+    assert engine.seen_dumps[0].mode == DUMP_MODE_DIFF
+    assert [entry.path for entry in engine.seen_dumps[0].entries] == ["Sources/App.swift"]
+    assert engine.seen_prs[0].changed_files == ("Sources/App.swift",)
+    assert set(engine.seen_prs[0].diff_patches) == {"Sources/App.swift"}
+    assert set(engine.seen_prs[0].diff_right_lines) == {"Sources/App.swift"}
 
 
 async def test_use_case_still_falls_back_when_source_change_was_budget_trimmed() -> None:

@@ -79,25 +79,40 @@ class ReviewPullRequestUseCase:
             dump = await self._file_collector.collect(repo_path, pr.changed_files, self._budget)
 
         # 이 지점 이후 파일 I/O 없음 — dump 는 메모리에 담긴 스냅샷. 락을 풀어도 안전.
+        review_pr = _filter_pr_to_reviewable_changes(pr, dump)
+        if not review_pr.changed_files:
+            logger.info(
+                "skipping review for %s#%d — all changed files were excluded by policy",
+                pr.repo.full_name,
+                pr.number,
+            )
+            return
+        history = _filter_history_to_reviewable_paths(
+            history,
+            frozenset(dump.filter_excluded),
+        )
 
         # ── 1차 fallback: PRE-EMPTIVE (사전 예산 계산 기반) ────────────────
         # 변경 파일이 **예산 때문에** 잘려 나갔다면 전체-코드베이스 리뷰가 성립하지 않는다.
         # 단 바이너리/정책 필터로 제외된 변경 파일(예: .png) 은 fallback 을 트리거하면 안 된다
         # — 의미상 "diff 에서 봐도 못 보는 파일" 이라 fallback 해봐야 품질만 떨어진다.
-        if dump.exceeded_budget and _changed_trimmed_by_budget(pr, dump):
-            fallback_dump = await self._try_diff_fallback(pr)
+        if dump.exceeded_budget and _changed_trimmed_by_budget(review_pr, dump):
+            fallback_dump = await self._try_diff_fallback(review_pr)
             if fallback_dump is None:
                 logger.warning(
                     "budget exceeded for %s#%d — skipping review, posting notice",
-                    pr.repo.full_name, pr.number,
+                    review_pr.repo.full_name, review_pr.number,
                 )
-                await self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
+                await self._github.post_comment(
+                    review_pr,
+                    _budget_exceeded_message(review_pr, dump),
+                )
                 return
             dump = fallback_dump
 
         logger.info(
             "reviewing %s#%d — mode=%s files=%d chars=%d excluded=%d",
-            pr.repo.full_name, pr.number, dump.mode,
+            review_pr.repo.full_name, review_pr.number, dump.mode,
             len(dump.entries), dump.total_chars, len(dump.excluded),
         )
 
@@ -111,7 +126,10 @@ class ReviewPullRequestUseCase:
         # 사유 — diff 배지 문구를 "예산 초과" vs "엔진 거부 후 재시도" 로 분기시키는 근거.
         entered_diff_preemptively = dump.mode == DUMP_MODE_DIFF
         result = await self._review_with_fallback(
-            pr, dump, entered_diff_preemptively=entered_diff_preemptively, history=history,
+            review_pr,
+            dump,
+            entered_diff_preemptively=entered_diff_preemptively,
+            history=history,
         )
         if result is None:
             return  # 진단 코멘트 게시 후 정리 종료
@@ -119,15 +137,20 @@ class ReviewPullRequestUseCase:
         # 모델이 제안한 인라인 코멘트를 PR diff 의 RIGHT-side 라인 집합과 교차해 걸러낸다.
         # (변경되지 않은 파일/줄에 코멘트를 달면 GitHub 가 422 로 리뷰 전체를 거부한다.)
         # 걸러진 항목은 본문 렌더링에도 반영되도록 ReviewResult 자체를 새로 만든다.
-        result = _filter_findings_to_diff(result, pr.diff_right_lines, pr.repo.full_name, pr.number)
+        result = _filter_findings_to_diff(
+            result,
+            review_pr.diff_right_lines,
+            review_pr.repo.full_name,
+            review_pr.number,
+        )
 
-        await self._github.post_review(pr, result)
+        await self._github.post_review(review_pr, result)
 
         # 메타리플라이는 review post 성공 후 별도 단계로 게시. review post 가 실패했으면
         # meta-reply 의 의미 자체가 사라지므로 진행 안 함. 한 건이라도 실패해도 서로
         # 영향 없도록 `gather(return_exceptions=True)` (현재는 ≤1건이라 실질적으로 단일).
         if result.meta_replies:
-            await self._post_meta_replies(pr, result, history)
+            await self._post_meta_replies(review_pr, result, history)
 
     async def _post_meta_replies(
         self, pr: PullRequest, result: ReviewResult, history: ReviewHistory,
@@ -334,6 +357,52 @@ def _changed_trimmed_by_budget(pr: PullRequest, dump: FileDump) -> bool:
     if not budget_cut:
         return False
     return not budget_cut.isdisjoint(pr.changed_files)
+
+
+def _filter_pr_to_reviewable_changes(pr: PullRequest, dump: FileDump) -> PullRequest:
+    """Remove changed paths that the file collector excluded by policy.
+
+    The prompt should not list README/assets/lock files as changed when the repo policy says
+    they are out of scope. Keeping only reviewable changed files also makes diff fallback use
+    the same scope as full mode.
+    """
+    policy_excluded = set(dump.filter_excluded)
+    if not policy_excluded:
+        return pr
+
+    changed_files = tuple(p for p in pr.changed_files if p not in policy_excluded)
+    if changed_files == pr.changed_files:
+        return pr
+
+    changed_set = set(changed_files)
+    return replace(
+        pr,
+        changed_files=changed_files,
+        diff_right_lines={
+            path: lines for path, lines in pr.diff_right_lines.items()
+            if path in changed_set
+        },
+        diff_patches={
+            path: patch for path, patch in pr.diff_patches.items()
+            if path in changed_set
+        },
+    )
+
+
+def _filter_history_to_reviewable_paths(
+    history: ReviewHistory,
+    policy_excluded: frozenset[str],
+) -> ReviewHistory:
+    if history.is_empty or not policy_excluded:
+        return history
+
+    comments = tuple(
+        comment for comment in history.comments
+        if comment.kind != "inline" or comment.path not in policy_excluded
+    )
+    if len(comments) == len(history.comments):
+        return history
+    return replace(history, comments=comments)
 
 
 def _filter_findings_to_diff(

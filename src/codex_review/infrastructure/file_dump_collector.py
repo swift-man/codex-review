@@ -2,9 +2,13 @@ import asyncio
 import logging
 from pathlib import Path
 
-from codex_review.domain import FileDump, FileEntry, TokenBudget
+from codex_review.domain import FileDump, FileEntry, ReviewPathFilter, TokenBudget
+
+from .reviewbot_config import load_review_path_filter
 
 logger = logging.getLogger(__name__)
+
+_REVIEWBOT_CONFIG_NAME = ".reviewbot.yml"
 
 _ALWAYS_SKIP_DIRS = {
     # VCS / Python / JS 공통
@@ -194,6 +198,7 @@ class FileDumpCollector:
         # git ls-files 는 async subprocess 로 먼저 실행 — 진짜 소스 파일만 뽑아낸다.
         tracked = await _git_ls_files(root)
         changed_set = set(changed_files)
+        path_filter = _load_path_filter(root, changed_set)
         # 예산이 부족할 때 하위 우선순위 파일부터 잘려 나가야 PR 컨텍스트가 살아남는다.
         ordered = _sort_by_priority(tracked, changed_set)
 
@@ -204,20 +209,35 @@ class FileDumpCollector:
             _build_dump_sync,
             root,
             ordered,
+            changed_files,
             changed_set,
             budget,
             self._file_max_bytes,
             self._data_file_max_bytes,
+            path_filter,
         )
+
+
+def _load_path_filter(root: Path, changed_set: set[str]) -> ReviewPathFilter:
+    if _REVIEWBOT_CONFIG_NAME not in changed_set:
+        return load_review_path_filter(root)
+
+    logger.info(
+        "%s changed in this PR; ignoring head-version review path filter for safety",
+        _REVIEWBOT_CONFIG_NAME,
+    )
+    return ReviewPathFilter.allow_all()
 
 
 def _build_dump_sync(
     root: Path,
     ordered: list[str],
+    changed_files: tuple[str, ...],
     changed_set: set[str],
     budget: TokenBudget,
     file_max_bytes: int,
     data_file_max_bytes: int,
+    path_filter: ReviewPathFilter,
 ) -> FileDump:
     """순수 동기 파일 수집. `collect()` 가 스레드로 오프로드해 호출한다.
 
@@ -229,7 +249,10 @@ def _build_dump_sync(
     이전에는 둘을 합쳐 `excluded` 에 넣어 바이너리 파일 포함 PR 이 "예산 초과" 로 오진됐다.
     """
     entries: list[FileEntry] = []
-    filter_excluded: list[str] = []
+    filter_excluded: list[str] = [
+        path for path in changed_files if not path_filter.allows(path)
+    ]
+    filter_excluded_set = set(filter_excluded)
     budget_trimmed: list[str] = []
     total_chars = 0
     max_chars = budget.max_chars()
@@ -238,13 +261,19 @@ def _build_dump_sync(
         abs_path = root / rel_path
         if not abs_path.is_file():
             continue
-        if _should_skip(rel_path, abs_path, file_max_bytes, data_file_max_bytes):
-            filter_excluded.append(rel_path)
+        if _should_skip(
+            rel_path, abs_path, file_max_bytes, data_file_max_bytes, path_filter
+        ):
+            if rel_path not in filter_excluded_set:
+                filter_excluded.append(rel_path)
+                filter_excluded_set.add(rel_path)
             continue
         try:
             content = abs_path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
-            filter_excluded.append(rel_path)
+            if rel_path not in filter_excluded_set:
+                filter_excluded.append(rel_path)
+                filter_excluded_set.add(rel_path)
             continue
 
         # 32자 여유는 프롬프트에 붙는 "--- FILE: path ---" / 라인 번호 접두사 등 프레이밍
@@ -332,6 +361,7 @@ def _should_skip(
     abs_path: Path,
     file_max_bytes: int,
     data_file_max_bytes: int,
+    path_filter: ReviewPathFilter,
 ) -> bool:
     """Decide whether to exclude a tracked file from the dump.
 
@@ -339,6 +369,11 @@ def _should_skip(
     각 단계가 실패 이유(왜 제외되는지)를 한 군데 모아 두므로 Tier 추가/삭제 시 영향 범위가
     작아진다.
     """
+    if path_filter.always_allows(rel_path):
+        return False
+    if not path_filter.allows(rel_path):
+        return True
+
     parts = rel_path.split("/")
     if _is_in_always_skip_dir(parts):
         return True
@@ -355,9 +390,7 @@ def _is_in_always_skip_dir(parts: list[str]) -> bool:
     if any(p in _ALWAYS_SKIP_DIRS for p in parts):
         return True
     # Xcode asset catalog 은 번들 디렉터리명이 `.xcassets` 로 끝난다. 하위 전체 제외.
-    if any(p.endswith(".xcassets") for p in parts):
-        return True
-    return False
+    return any(p.endswith(".xcassets") for p in parts)
 
 
 def _is_hard_excluded_name_or_suffix(name: str, suffix: str) -> bool:
@@ -365,9 +398,7 @@ def _is_hard_excluded_name_or_suffix(name: str, suffix: str) -> bool:
         return True
     if suffix in _SKIP_SUFFIXES:
         return True
-    if _is_double_suffix_skip(name):
-        return True
-    return False
+    return _is_double_suffix_skip(name)
 
 
 def _is_important_config(name: str) -> bool:

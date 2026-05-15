@@ -43,6 +43,108 @@ async def test_collect_filters_skip_dirs_and_binaries(repo: Path) -> None:
     assert "logo.png" not in paths
 
 
+async def test_collect_applies_reviewbot_config_scope(repo: Path) -> None:
+    (repo / ".reviewbot.yml").write_text(
+        """
+version: 1
+review:
+  include:
+    - "**/*.swift"
+    - "Package.swift"
+  exclude:
+    - "**/Generated/**"
+    - "**/*.md"
+  always_review:
+    - "AGENTS.md"
+""",
+        encoding="utf-8",
+    )
+    (repo / "Sources").mkdir()
+    (repo / "Sources" / "App.swift").write_text("let app = App()\n", encoding="utf-8")
+    (repo / "Sources" / "Generated").mkdir()
+    (repo / "Sources" / "Generated" / "API.swift").write_text(
+        "// generated\n",
+        encoding="utf-8",
+    )
+    (repo / "AGENTS.md").write_text("# agent rules\n", encoding="utf-8")
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = await collector.collect(
+        repo,
+        changed_files=(
+            "Sources/App.swift",
+            "Sources/Generated/API.swift",
+            "README.md",
+            "AGENTS.md",
+        ),
+        budget=TokenBudget(1_000_000),
+    )
+
+    paths = {e.path for e in dump.entries}
+    assert "Sources/App.swift" in paths
+    assert "AGENTS.md" in paths
+    assert ".reviewbot.yml" in paths
+
+    assert "README.md" not in paths
+    assert "Sources/Generated/API.swift" not in paths
+    assert "README.md" in dump.filter_excluded
+    assert "Sources/Generated/API.swift" in dump.filter_excluded
+    assert dump.exceeded_budget is False
+
+
+async def test_collect_ignores_reviewbot_config_when_config_changed(repo: Path) -> None:
+    (repo / ".reviewbot.yml").write_text(
+        """
+version: 1
+review:
+  include:
+    - "**/*.swift"
+  exclude:
+    - "**/*.md"
+""",
+        encoding="utf-8",
+    )
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = await collector.collect(
+        repo,
+        changed_files=(".reviewbot.yml", "README.md"),
+        budget=TokenBudget(1_000_000),
+    )
+
+    paths = {e.path for e in dump.entries}
+    assert ".reviewbot.yml" in paths
+    assert "README.md" in paths
+
+
+async def test_collect_marks_deleted_policy_excluded_changed_file(repo: Path) -> None:
+    (repo / ".reviewbot.yml").write_text(
+        """
+version: 1
+review:
+  exclude:
+    - "**/*.md"
+""",
+        encoding="utf-8",
+    )
+    _commit_all(repo)
+    (repo / "README.md").unlink()
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = await collector.collect(
+        repo,
+        changed_files=("README.md",),
+        budget=TokenBudget(1_000_000),
+    )
+
+    assert "README.md" in dump.filter_excluded
+    assert "README.md" not in {e.path for e in dump.entries}
+    assert dump.exceeded_budget is False
+
+
 async def test_collect_prioritizes_changed_files(repo: Path) -> None:
     collector = FileDumpCollector(file_max_bytes=1024)
     dump = await collector.collect(repo, changed_files=("README.md",), budget=TokenBudget(10_000))
