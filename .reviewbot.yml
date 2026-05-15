@@ -1,0 +1,83 @@
+version: 1
+
+review:
+  include:
+    # Python source and tests
+    - "src/**/*.py"
+    - "tests/**/*.py"
+
+    # Runtime, packaging, and quality gates
+    - "pyproject.toml"
+    - "requirements*.txt"
+    - "setup.cfg"
+    - "mypy.ini"
+    - "ruff.toml"
+    - ".ruff.toml"
+
+    # Operational files
+    - "scripts/**/*.sh"
+    - "deploy/**/*.conf"
+    - ".github/workflows/**/*.yml"
+    - ".github/workflows/**/*.yaml"
+    - ".coderabbit.yaml"
+    - "Dockerfile"
+    - "docker-compose*.yml"
+    - "docker-compose*.yaml"
+
+  exclude:
+    # dependency / local environment
+    - ".venv/**"
+    - "venv/**"
+    - "env/**"
+    - "node_modules/**"
+    - "vendor/**"
+
+    # build, test, and type-check output
+    - "__pycache__/**"
+    - "**/__pycache__/**"
+    - ".pytest_cache/**"
+    - ".mypy_cache/**"
+    - ".ruff_cache/**"
+    - ".tox/**"
+    - ".nox/**"
+    - ".coverage"
+    - "coverage.xml"
+    - "htmlcov/**"
+    - "dist/**"
+    - "build/**"
+    - "*.egg-info/**"
+
+    # generated / binary / bulky resources
+    - "docs/**"
+    - "site/**"
+    - "**/*.png"
+    - "**/*.jpg"
+    - "**/*.jpeg"
+    - "**/*.gif"
+    - "**/*.webp"
+    - "**/*.pdf"
+    - "**/*.mp4"
+    - "**/*.mov"
+
+    # lock files
+    - "uv.lock"
+    - "poetry.lock"
+    - "Pipfile.lock"
+    - "package-lock.json"
+    - "yarn.lock"
+    - "pnpm-lock.yaml"
+
+    # docs and local-only config
+    - "README.md"
+    - "CHANGELOG.md"
+    - "**/*.md"
+    - ".env"
+    - ".env.*"
+    - "scripts/local_review_env.sh"
+
+  always_review:
+    - ".reviewbot.yml"
+    - "AGENTS.md"
+    - "pyproject.toml"
+    - ".github/workflows/**/*.yml"
+    - ".github/workflows/**/*.yaml"
