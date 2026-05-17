@@ -3,6 +3,7 @@ import contextlib
 import json
 import logging
 import re
+from collections.abc import Iterator
 
 from codex_review.domain import Finding, MetaReply, ReviewEvent, ReviewResult
 from codex_review.domain.finding import (
@@ -15,6 +16,8 @@ from codex_review.domain.finding import (
 # 메타리플라이는 노이즈 차단을 위해 한 라운드에 1건만 허용. 모델이 더 많이 산출해도
 # 첫 항목만 채택하고 로그만 남긴다 (작성자 정책: "대댓글은 1개면 될 것 같다").
 _META_REPLY_MAX = 1
+_SUMMARY_SUFFIX_CANDIDATE_LIMIT = 4
+_SUMMARY_SUFFIX_MAX_CHARS = 1_048_576
 
 # 레거시 값 → 새 4단계 매핑. 이전 프롬프트가 "must_fix"/"suggest" 만 쓰던 시기의
 # 응답도 무해하게 받아들이기 위함 — 신규 프롬프트 배포 직후 쌓여 있던 작업 큐 방어.
@@ -194,7 +197,36 @@ def _extract_json(text: str) -> dict[str, object] | None:
         data = _loads_json_dict(candidate)
         if data is not None and "summary" in data:
             return data
+    for candidate in _summary_json_suffix_candidates(text):
+        data = _loads_json_dict(candidate)
+        if data is not None and "summary" in data:
+            return data
     return None
+
+
+def _summary_json_suffix_candidates(text: str) -> Iterator[str]:
+    """Yield a few likely final review JSON suffixes without materializing all braces.
+
+    This is a bounded fallback for prefixed model output where malformed quotes can
+    confuse brace counting before `_find_json_blocks` finds the final review object.
+    """
+    search_end = len(text)
+    attempts = 0
+    while attempts < _SUMMARY_SUFFIX_CANDIDATE_LIMIT:
+        summary_index = text.rfind('"summary"', 0, search_end)
+        if summary_index < 0:
+            return
+        start = text.rfind("{", 0, summary_index)
+        end = text.rfind("}", summary_index)
+        if start >= 0 and end > start:
+            candidate = text[start:end + 1]
+            if len(candidate) <= _SUMMARY_SUFFIX_MAX_CHARS:
+                yield candidate
+            attempts += 1
+            search_end = start
+            continue
+        attempts += 1
+        search_end = summary_index
 
 
 def _loads_json_dict(text: str) -> dict[str, object] | None:
@@ -264,7 +296,19 @@ def _looks_like_json_string_delimiter(text: str, quote_index: int) -> bool:
     next_index = quote_index + 1
     while next_index < len(text) and text[next_index] in " \t\r\n":
         next_index += 1
-    return next_index == len(text) or text[next_index] in ":,]}"
+    if next_index == len(text) or text[next_index] in ":,]":
+        return True
+    if text[next_index] != "}":
+        return False
+
+    # A quote before `}` can close the last string field in an object. It can also
+    # be part of prose/code inside a malformed string (`"x" } marker`). Treat it
+    # as structural only when the object close is followed by another JSON
+    # delimiter or by the end of the candidate.
+    after_brace = next_index + 1
+    while after_brace < len(text) and text[after_brace] in " \t\r\n":
+        after_brace += 1
+    return after_brace == len(text) or text[after_brace] in ",]}"
 
 
 def _parse_event(value: object) -> ReviewEvent:
