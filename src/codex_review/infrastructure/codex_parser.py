@@ -162,8 +162,10 @@ def _parse_meta_replies(raw: object) -> list[MetaReply]:
         out.append(MetaReply(reply_to_comment_id=comment_id, body=body))
     if len(out) > _META_REPLY_MAX:
         logger.info(
-            "model returned %d meta_replies — capping to %d (using model's own ordering: first item kept)",
-            len(out), _META_REPLY_MAX,
+            "model returned %d meta_replies — capping to %d "
+            "(using model's own ordering: first item kept)",
+            len(out),
+            _META_REPLY_MAX,
         )
         out = out[:_META_REPLY_MAX]
     return out
@@ -172,13 +174,15 @@ def _parse_meta_replies(raw: object) -> list[MetaReply]:
 def _extract_json(text: str) -> dict[str, object] | None:
     stripped = text.strip()
     if stripped.startswith("{"):
-        # 통째로 JSON 이면 그대로 사용. 파싱 실패는 "JSON 아닐 수 있다" 는 정상 신호이므로 의도적으로 무시.
+        # 통째로 JSON 이면 그대로 사용. 파싱 실패는 "JSON 아닐 수 있다" 는
+        # 정상 신호이므로 의도적으로 무시.
         # `RecursionError` 는 모델이 비정상적으로 깊게 중첩된 출력을 냈을 때 던질 수 있어
         # 함께 잡는다 — 정화 시도가 실패하면 다음 후보로 넘어가고, 마지막엔 None 으로 수렴해
         # parse_review 의 plain-text fallback 경로가 동작하게 한다 (codex / gemini /
         # coderabbit PR #20 Major).
-        with contextlib.suppress(json.JSONDecodeError, RecursionError):
-            return json.loads(stripped)
+        data = _loads_json_dict(stripped)
+        if data is not None:
+            return data
 
     # Codex agentic 실행은 "추론 → 최종 답" 순서로 여러 JSON 조각을 내뱉을 수 있다.
     # 예: 중간에 `{"note": "..."}` 같은 로그 성격의 JSON 이 섞여도 최종 리뷰 JSON 은 맨 뒤.
@@ -186,11 +190,80 @@ def _extract_json(text: str) -> dict[str, object] | None:
     candidates = _find_json_blocks(text)
     for candidate in reversed(candidates):
         # 후보 하나가 JSON 이 아니면 다음 후보로 넘어간다 — JSONDecodeError 는 의도적으로 삼킨다.
-        with contextlib.suppress(json.JSONDecodeError, RecursionError):
-            data = json.loads(candidate)
-            if isinstance(data, dict) and "summary" in data:
-                return data
+        data = _loads_json_dict(candidate)
+        if data is not None and "summary" in data:
+            return data
     return None
+
+
+def _loads_json_dict(text: str) -> dict[str, object] | None:
+    with contextlib.suppress(json.JSONDecodeError, RecursionError):
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+
+    repaired = _escape_unescaped_string_quotes(text)
+    if repaired == text:
+        return None
+
+    with contextlib.suppress(json.JSONDecodeError, RecursionError):
+        data = json.loads(repaired)
+        if isinstance(data, dict):
+            logger.warning(
+                "codex output contained unescaped quotes inside JSON strings; repaired"
+            )
+            return data
+    return None
+
+
+def _escape_unescaped_string_quotes(text: str) -> str:
+    """Repair common model JSON breakage from unescaped quotes inside strings.
+
+    Example:
+      {"summary": "Package.swift의 "1.4.0"..<"1.12.0" 범위"}
+
+    JSON string delimiters are followed by a structural token (`:`, `,`, `]`, `}`),
+    while accidental inner quotes are followed by prose/code characters. This keeps
+    valid delimiters and escapes the latter.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    changed = False
+
+    for index, ch in enumerate(text):
+        if escape:
+            out.append(ch)
+            escape = False
+            continue
+        if in_string and ch == "\\":
+            out.append(ch)
+            escape = True
+            continue
+        if ch != '"':
+            out.append(ch)
+            continue
+        if not in_string:
+            in_string = True
+            out.append(ch)
+            continue
+        if _looks_like_json_string_delimiter(text, index):
+            in_string = False
+            out.append(ch)
+            continue
+        out.append(r"\"")
+        changed = True
+
+    if not changed:
+        return text
+    return "".join(out)
+
+
+def _looks_like_json_string_delimiter(text: str, quote_index: int) -> bool:
+    next_index = quote_index + 1
+    while next_index < len(text) and text[next_index] in " \t\r\n":
+        next_index += 1
+    return next_index == len(text) or text[next_index] in ":,]}"
 
 
 def _parse_event(value: object) -> ReviewEvent:
@@ -218,8 +291,9 @@ def _parse_findings(raw: object) -> list[Finding]:
         # dict repr 가 그대로 남는다. 깊이 상한으로 무한 재귀 방지.
         body = _sanitize_body(str(item.get("body") or "").strip())
         line = _coerce_line(item.get("line"))
-        # 라인 번호가 없는 지적은 PR 인라인 코멘트로 붙을 수 없다. 제품 스펙상 "라인 고정 기술 단위
-        # 코멘트"만 인라인 대상이며, 나머지 거시적 지적은 improvements/must_fix 섹션으로 모델이 분류해야 한다.
+        # 라인 번호가 없는 지적은 PR 인라인 코멘트로 붙을 수 없다. 제품 스펙상
+        # "라인 고정 기술 단위 코멘트"만 인라인 대상이며, 나머지 거시적 지적은
+        # improvements/must_fix 섹션으로 모델이 분류해야 한다.
         if not path or not body or line is None:
             continue
         severity = _coerce_severity(item.get("severity"))
