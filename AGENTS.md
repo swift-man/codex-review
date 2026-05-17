@@ -122,6 +122,9 @@ class InMemoryUserRepository:
 - 커밋 메시지: `<type>: <subject>` (예: `feat: add user registration use case`)
 - PR 생성 전: `ruff check`, `mypy`, `pytest` 모두 통과해야 한다.
 - 한 PR은 하나의 논리적 변경만 포함한다.
+- `main`/기본 브랜치에는 직접 push 하지 않는다. 모든 변경은 작업 브랜치에서 커밋 후 PR로 제출한다.
+- 사용자가 "즉시 머지", "바로 반영"을 요청해도 먼저 PR을 생성하고, PR URL과 검증 결과를 공유한 뒤 머지 절차를 따른다.
+- 실수로 `main`/기본 브랜치에 직접 push 한 경우 즉시 사용자에게 알리고, 직접 push 된 커밋을 되돌리는 PR과 원래 변경 PR을 분리해 복구한다.
 
 ## 코드리뷰 분석 및 대응
 
