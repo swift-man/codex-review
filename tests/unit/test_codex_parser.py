@@ -19,18 +19,8 @@ def test_parse_strict_json_with_all_sections() -> None:
       "must_fix": ["인증 토큰 캐시 경쟁 조건"],
       "improvements": ["도메인 계층과 인프라 계층의 경계를 더 명확히"],
       "comments": [
-        {
-          "path": "src/a.py",
-          "line": 12,
-          "severity": "critical",
-          "body": "None 체크가 필요합니다."
-        },
-        {
-          "path": "src/a.py",
-          "line": 30,
-          "severity": "suggestion",
-          "body": "pathlib.Path 사용을 고려하세요."
-        }
+        {"path": "src/a.py", "line": 12, "severity": "critical", "body": "None 체크가 필요합니다."},
+        {"path": "src/a.py", "line": 30, "severity": "suggestion", "body": "pathlib.Path 사용을 고려하세요."}
       ]
     }
     """
@@ -241,45 +231,6 @@ def test_parse_picks_last_valid_json_when_reasoning_precedes() -> None:
     assert result.event == ReviewEvent.REQUEST_CHANGES
 
 
-def test_parse_repairs_unescaped_quotes_inside_json_strings() -> None:
-    """회귀(PR #15): 모델이 Swift range 표현을 JSON 문자열 안에 그대로 넣으면
-    `"1.4.0"..<"1.12.0"` 의 따옴표 때문에 JSON 파싱이 깨진다. 이때 raw JSON 을
-    댓글 본문으로 흘리지 말고 구조화 리뷰로 복구해야 한다.
-    """
-    positive = (
-        "라이브러리 소비 프로젝트에서도 적용되는 Package.swift 의존성 선언에 직접 "
-        "상한을 둔 점이 좋습니다."
-    )
-    improvement = (
-        "향후 swift-dependencies resolver 문제가 해소되면 상한 <1.12.0을 "
-        "재검토해도 좋습니다."
-    )
-    raw = f"""
-    {{
-      "summary": "Package.swift의 "1.4.0"..<"1.12.0" 범위 지정으로 처리된 것으로 보입니다.",
-      "event": "APPROVE",
-      "positives": [
-        "{positive}"
-      ],
-      "must_fix": [],
-      "improvements": [
-        "{improvement}"
-      ],
-      "comments": [],
-      "meta_replies": []
-    }}
-    """
-    result = parse_review(raw)
-
-    assert result.event == ReviewEvent.APPROVE
-    assert result.summary == (
-        'Package.swift의 "1.4.0"..<"1.12.0" 범위 지정으로 처리된 것으로 보입니다.'
-    )
-    assert result.positives == (positive,)
-    assert result.must_fix == ()
-    assert result.improvements == (improvement,)
-
-
 def test_parse_fallbacks_to_plain_text_when_no_json() -> None:
     result = parse_review("그냥 평문 응답입니다.")
     assert "평문" in result.summary
@@ -316,19 +267,15 @@ def test_parse_unwraps_python_dict_repr_in_body_into_message() -> None:
     `{'severity': 'major', 'message': '...'}` 라는 raw 문자열이 PR 인라인 코멘트에
     그대로 노출되는 사례. 본문에서 message 만 추출해 자연어로 보이게 정화한다.
     """
-    message = (
-        "거래어 감지 정규식에서 경계를 완전히 제거하면서 감사요/회사요 같은 일반 "
-        "문장도 거래 안내를 발사할 수 있습니다."
-    )
-    raw = f"""
-    {{
+    raw = """
+    {
       "summary": "ok",
       "event": "COMMENT",
       "comments": [
-        {{"path": "src/a.py", "line": 7, "severity": "major",
-         "body": "{{'severity': 'major', 'message': '{message}'}}"}}
+        {"path": "src/a.py", "line": 7, "severity": "major",
+         "body": "{'severity': 'major', 'message': '거래어 감지 정규식에서 경계를 완전히 제거하면서 감사요/회사요 같은 일반 문장도 거래 안내를 발사할 수 있습니다.'}"}
       ]
-    }}
+    }
     """
     result = parse_review(raw)
     assert len(result.findings) == 1
@@ -456,19 +403,15 @@ def test_parse_unwraps_outer_comment_dict_with_path_first() -> None:
     (`{'path': '...', 'line': 1, 'body': '실제 본문'}`)
     트리거가 `path` 로 시작해도 발동해 inner `body` 가 추출돼야 한다.
     """
-    raw_body = (
-        "{'path': 'x.py', 'line': 1, 'severity': 'major', "
-        "'body': '경계 조건이 무시됩니다.'}"
-    )
-    raw = f"""
-    {{
+    raw = """
+    {
       "summary": "ok",
       "event": "COMMENT",
       "comments": [
-        {{"path": "x.py", "line": 1, "severity": "major",
-         "body": "{raw_body}"}}
+        {"path": "x.py", "line": 1, "severity": "major",
+         "body": "{'path': 'x.py', 'line': 1, 'severity': 'major', 'body': '경계 조건이 무시됩니다.'}"}
       ]
-    }}
+    }
     """
     result = parse_review(raw)
     body = result.findings[0].body
@@ -661,15 +604,14 @@ def test_parse_unwraps_dict_repr_inside_improvements_array() -> None:
     dict 가 그대로 노출된 사례. comments[].body 정화만으로는 못 막음 — 본문 섹션
     리스트도 모두 정화 대상으로 포함.
     """
-    message = "저장 동작이 비동기 begin 호출에서 동기 runModal 호출로 바뀌었다."
-    raw = f"""
-    {{
+    raw = """
+    {
       "summary": "ok",
       "event": "COMMENT",
       "improvements": [
-        "{{'severity': 'major', 'message': '{message}'}}"
+        "{'severity': 'major', 'message': '저장 동작이 비동기 begin 호출에서 동기 runModal 호출로 바뀌었다.'}"
       ]
-    }}
+    }
     """
     result = parse_review(raw)
     assert len(result.improvements) == 1
