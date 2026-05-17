@@ -18,6 +18,7 @@ from codex_review.domain.finding import (
 # 첫 항목만 채택하고 로그만 남긴다 (작성자 정책: "대댓글은 1개면 될 것 같다").
 _META_REPLY_MAX = 1
 _SUMMARY_SUFFIX_CANDIDATE_LIMIT = 4
+_SUMMARY_SUFFIX_END_CANDIDATE_LIMIT = 16
 _SUMMARY_SUFFIX_MAX_CHARS = 1_048_576
 
 # 레거시 값 → 새 4단계 매핑. 이전 프롬프트가 "must_fix"/"suggest" 만 쓰던 시기의
@@ -116,45 +117,50 @@ def _find_json_blocks(text: str) -> list[str]:
             i += 1
             continue
         # `{` 발견 — 균형 매칭 시도.
-        start = i
-        depth = 0
-        in_string = False
-        escape = False
-        string_is_key = False
-        stack: list[_JsonScanFrame] = []
-        while i < n:
-            ch = text[i]
-            if escape:
-                escape = False
-            elif in_string:
-                if ch == "\\":
-                    escape = True
-                elif ch == '"' and _looks_like_json_string_delimiter(
-                    text, i, string_is_key=string_is_key
-                ):
-                    in_string = False
-                    _mark_json_string_finished(stack, is_key=string_is_key)
-            else:
-                if ch == '"':
-                    in_string = True
-                    string_is_key = _starts_object_key_string(stack)
-                elif ch == "{":
-                    depth += 1
-                    _scan_json_structure_char(stack, ch)
-                elif ch == "}":
-                    _scan_json_structure_char(stack, ch)
-                    depth -= 1
-                    if depth == 0:
-                        blocks.append(text[start:i + 1])
-                        i += 1
-                        break
-                else:
-                    _scan_json_structure_char(stack, ch)
-            i += 1
-        else:
+        end = _find_json_object_end(text, i)
+        if end is None:
             # 균형 안 맞음 — 더 이상 후보 없음.
             break
+        blocks.append(text[i:end + 1])
+        i = end + 1
     return blocks
+
+
+def _find_json_object_end(text: str, start: int) -> int | None:
+    depth = 0
+    in_string = False
+    escape = False
+    string_is_key = False
+    stack: list[_JsonScanFrame] = []
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if escape:
+            escape = False
+        elif in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"' and _looks_like_json_string_delimiter(
+                text, i, string_is_key=string_is_key
+            ):
+                in_string = False
+                _mark_json_string_finished(stack, is_key=string_is_key)
+        else:
+            if ch == '"':
+                in_string = True
+                string_is_key = _starts_object_key_string(stack)
+            elif ch == "{":
+                depth += 1
+                _scan_json_structure_char(stack, ch)
+            elif ch == "}":
+                _scan_json_structure_char(stack, ch)
+                depth -= 1
+                if depth == 0:
+                    return i
+            else:
+                _scan_json_structure_char(stack, ch)
+        i += 1
+    return None
 
 
 def parse_review(raw: str) -> ReviewResult:
@@ -288,16 +294,38 @@ def _summary_json_suffix_candidates(text: str) -> Iterator[str]:
         if summary_index < 0:
             return
         start = text.rfind("{", 0, summary_index)
-        end = text.rfind("}", summary_index)
-        if start >= 0 and end > start:
+        end = _find_json_object_end(text, start) if start >= 0 else None
+        if end is not None and end > start:
             candidate = text[start:end + 1]
             if len(candidate) <= _SUMMARY_SUFFIX_MAX_CHARS:
                 yield candidate
+        if start >= 0:
+            yield from _forward_closing_brace_suffix_candidates(text, start, end)
             attempts += 1
             search_end = start
             continue
         attempts += 1
         search_end = summary_index
+
+
+def _forward_closing_brace_suffix_candidates(
+    text: str, start: int, balanced_end: int | None
+) -> Iterator[str]:
+    """Yield bounded suffixes ending at forward `}` positions.
+
+    This catches prefixed output where an earlier unmatched `{` prevents normal block
+    extraction and arbitrary prose after the JSON root makes the final value quote
+    look non-structural while scanning the whole raw output.
+    """
+    attempts = 0
+    close_index = text.find("}", start)
+    while close_index >= 0 and attempts < _SUMMARY_SUFFIX_END_CANDIDATE_LIMIT:
+        if close_index != balanced_end:
+            candidate = text[start:close_index + 1]
+            if len(candidate) <= _SUMMARY_SUFFIX_MAX_CHARS:
+                yield candidate
+            attempts += 1
+        close_index = text.find("}", close_index + 1)
 
 
 def _loads_json_dict(text: str) -> dict[str, object] | None:

@@ -342,6 +342,20 @@ def test_parse_prefixed_json_preserves_object_snippet_inside_string() -> None:
     assert result.findings[0].body == '예: {"x": 1} 코드 조각도 본문으로 보존합니다.'
 
 
+def test_parse_summary_suffix_ignores_trailing_brace_noise() -> None:
+    raw = (
+        "debug { unfinished brace before final review\n"
+        "Final:\n"
+        '{"summary": "ok", "event": "APPROVE"}\n'
+        "trailing code fence noise:\n"
+        "}\n"
+    )
+    result = parse_review(raw)
+
+    assert result.summary == "ok"
+    assert result.event == ReviewEvent.APPROVE
+
+
 def test_parse_fallbacks_to_plain_text_when_no_json() -> None:
     result = parse_review("그냥 평문 응답입니다.")
     assert "평문" in result.summary
