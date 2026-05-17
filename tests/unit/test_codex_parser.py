@@ -280,6 +280,27 @@ def test_parse_repairs_unescaped_quotes_inside_json_strings() -> None:
     assert result.improvements == (improvement,)
 
 
+def test_parse_repairs_unescaped_quotes_when_reasoning_precedes_json() -> None:
+    """회귀(PR #27 리뷰): reasoning prefix가 있으면 먼저 JSON 후보를 잘라야 한다.
+    이 단계도 문자열 내부 따옴표가 깨져 있으면 실패할 수 있으므로 suffix 후보를
+    복구 파서에 직접 넣어 구조화 리뷰를 보존한다.
+    """
+    raw = (
+        "사고 과정: 먼저 변경 파일을 확인했습니다.\n"
+        '{"note": "intermediate"}\n'
+        "Final:\n"
+        "{\n"
+        '  "summary": "prefix가 있는 출력도 "{" marker를 본문으로 보존합니다.",\n'
+        '  "event": "APPROVE",\n'
+        '  "comments": []\n'
+        "}\n"
+    )
+    result = parse_review(raw)
+
+    assert result.event == ReviewEvent.APPROVE
+    assert result.summary == 'prefix가 있는 출력도 "{" marker를 본문으로 보존합니다.'
+
+
 def test_parse_fallbacks_to_plain_text_when_no_json() -> None:
     result = parse_review("그냥 평문 응답입니다.")
     assert "평문" in result.summary

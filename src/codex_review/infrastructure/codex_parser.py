@@ -193,7 +193,28 @@ def _extract_json(text: str) -> dict[str, object] | None:
         data = _loads_json_dict(candidate)
         if data is not None and "summary" in data:
             return data
+    for candidate in _json_object_substring_candidates(text):
+        # `_find_json_blocks` 는 정상 JSON 문자열의 따옴표만 이해한다. 문자열 내부
+        # quote 가 깨져 있으면 brace counting 이 후보 추출 전부터 어긋날 수 있으므로,
+        # 가능한 `{...}` 부분 문자열을 직접 복구 파서에 넣어 마지막 안전망을 둔다.
+        data = _loads_json_dict(candidate)
+        if data is not None and "summary" in data:
+            return data
     return None
+
+
+def _json_object_substring_candidates(text: str) -> list[str]:
+    starts = [index for index, ch in enumerate(text) if ch == "{"]
+    ends = [index for index, ch in enumerate(text) if ch == "}"]
+    candidates: list[str] = []
+    for start in reversed(starts):
+        for end in reversed(ends):
+            if end <= start:
+                break
+            candidate = text[start:end + 1]
+            if '"summary"' in candidate:
+                candidates.append(candidate)
+    return candidates
 
 
 def _loads_json_dict(text: str) -> dict[str, object] | None:
@@ -203,7 +224,7 @@ def _loads_json_dict(text: str) -> dict[str, object] | None:
             return data
 
     repaired = _escape_unescaped_string_quotes(text)
-    if repaired == text:
+    if repaired is text:
         return None
 
     with contextlib.suppress(json.JSONDecodeError, RecursionError):
