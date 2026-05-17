@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 from codex_review.domain import Finding, MetaReply, ReviewEvent, ReviewResult
 from codex_review.domain.finding import (
@@ -35,6 +36,66 @@ _LEGACY_SEVERITY_ALIASES: dict[str, str] = {
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _JsonScanFrame:
+    kind: str
+    state: str
+
+
+def _starts_object_key_string(stack: list[_JsonScanFrame]) -> bool:
+    return bool(stack and stack[-1].kind == "object" and stack[-1].state == "key")
+
+
+def _mark_json_value_finished(stack: list[_JsonScanFrame]) -> None:
+    if not stack:
+        return
+    if stack[-1].state == "value":
+        stack[-1].state = "after_value"
+
+
+def _mark_json_string_finished(stack: list[_JsonScanFrame], *, is_key: bool) -> None:
+    if not stack:
+        return
+    if is_key and stack[-1].kind == "object" and stack[-1].state == "key":
+        stack[-1].state = "colon"
+        return
+    _mark_json_value_finished(stack)
+
+
+def _scan_json_structure_char(stack: list[_JsonScanFrame], ch: str) -> None:
+    if ch in " \t\r\n":
+        return
+    if ch == "{":
+        stack.append(_JsonScanFrame(kind="object", state="key"))
+        return
+    if ch == "[":
+        stack.append(_JsonScanFrame(kind="array", state="value"))
+        return
+    if ch == "}":
+        if stack and stack[-1].kind == "object":
+            stack.pop()
+            _mark_json_value_finished(stack)
+        return
+    if ch == "]":
+        if stack and stack[-1].kind == "array":
+            stack.pop()
+            _mark_json_value_finished(stack)
+        return
+    if not stack:
+        return
+
+    frame = stack[-1]
+    if ch == ":" and frame.kind == "object" and frame.state == "colon":
+        frame.state = "value"
+    elif ch == ",":
+        if frame.kind == "object":
+            frame.state = "key"
+        elif frame.kind == "array":
+            frame.state = "value"
+    elif frame.state == "value":
+        frame.state = "after_value"
+
+
 def _find_json_blocks(text: str) -> list[str]:
     """텍스트에서 균형 잡힌 `{...}` 블록을 추출 (JSON string quote 인식).
 
@@ -59,6 +120,8 @@ def _find_json_blocks(text: str) -> list[str]:
         depth = 0
         in_string = False
         escape = False
+        string_is_key = False
+        stack: list[_JsonScanFrame] = []
         while i < n:
             ch = text[i]
             if escape:
@@ -66,19 +129,27 @@ def _find_json_blocks(text: str) -> list[str]:
             elif in_string:
                 if ch == "\\":
                     escape = True
-                elif ch == '"' and _looks_like_json_string_delimiter(text, i):
+                elif ch == '"' and _looks_like_json_string_delimiter(
+                    text, i, string_is_key=string_is_key
+                ):
                     in_string = False
+                    _mark_json_string_finished(stack, is_key=string_is_key)
             else:
                 if ch == '"':
                     in_string = True
+                    string_is_key = _starts_object_key_string(stack)
                 elif ch == "{":
                     depth += 1
+                    _scan_json_structure_char(stack, ch)
                 elif ch == "}":
+                    _scan_json_structure_char(stack, ch)
                     depth -= 1
                     if depth == 0:
                         blocks.append(text[start:i + 1])
                         i += 1
                         break
+                else:
+                    _scan_json_structure_char(stack, ch)
             i += 1
         else:
             # 균형 안 맞음 — 더 이상 후보 없음.
@@ -255,14 +326,16 @@ def _escape_unescaped_string_quotes(text: str) -> str:
     Example:
       {"summary": "Package.swift의 "1.4.0"..<"1.12.0" 범위"}
 
-    JSON string delimiters are followed by a structural token (`:`, `,`, `]`, `}`),
-    while accidental inner quotes are followed by prose/code characters. This keeps
-    valid delimiters and escapes the latter.
+    Object key delimiters are followed by `:`, while string value delimiters are
+    followed by value separators (`,`, `]`, `}`) or the candidate end. Accidental
+    inner quotes in prose/code snippets are escaped instead.
     """
     out: list[str] = []
     in_string = False
     escape = False
     changed = False
+    string_is_key = False
+    stack: list[_JsonScanFrame] = []
 
     for index, ch in enumerate(text):
         if escape:
@@ -274,14 +347,20 @@ def _escape_unescaped_string_quotes(text: str) -> str:
             escape = True
             continue
         if ch != '"':
+            if not in_string:
+                _scan_json_structure_char(stack, ch)
             out.append(ch)
             continue
         if not in_string:
             in_string = True
+            string_is_key = _starts_object_key_string(stack)
             out.append(ch)
             continue
-        if _looks_like_json_string_delimiter(text, index):
+        if _looks_like_json_string_delimiter(
+            text, index, string_is_key=string_is_key
+        ):
             in_string = False
+            _mark_json_string_finished(stack, is_key=string_is_key)
             out.append(ch)
             continue
         out.append(r"\"")
@@ -292,12 +371,18 @@ def _escape_unescaped_string_quotes(text: str) -> str:
     return "".join(out)
 
 
-def _looks_like_json_string_delimiter(text: str, quote_index: int) -> bool:
+def _looks_like_json_string_delimiter(
+    text: str, quote_index: int, *, string_is_key: bool
+) -> bool:
     next_index = quote_index + 1
     while next_index < len(text) and text[next_index] in " \t\r\n":
         next_index += 1
-    if next_index == len(text) or text[next_index] in ":,]":
+    if next_index == len(text):
         return True
+    if text[next_index] == ":":
+        return string_is_key
+    if text[next_index] in ",]":
+        return not string_is_key
     if text[next_index] != "}":
         return False
 

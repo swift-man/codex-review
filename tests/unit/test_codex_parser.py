@@ -323,6 +323,25 @@ def test_parse_prefixed_json_preserves_quote_before_brace_inside_string() -> Non
     assert result.summary == '본문 안의 코드 조각 "x" } marker를 보존합니다.'
 
 
+def test_parse_prefixed_json_preserves_object_snippet_inside_string() -> None:
+    raw = (
+        "Final:\n"
+        "{\n"
+        '  "summary": "ok",\n'
+        '  "event": "COMMENT",\n'
+        '  "comments": [\n'
+        '    {"path": "src/a.py", "line": 10, "severity": "major", '
+        '"body": "예: {"x": 1} 코드 조각도 본문으로 보존합니다."}\n'
+        "  ]\n"
+        "}\n"
+    )
+    result = parse_review(raw)
+
+    assert result.event == ReviewEvent.REQUEST_CHANGES
+    assert len(result.findings) == 1
+    assert result.findings[0].body == '예: {"x": 1} 코드 조각도 본문으로 보존합니다.'
+
+
 def test_parse_fallbacks_to_plain_text_when_no_json() -> None:
     result = parse_review("그냥 평문 응답입니다.")
     assert "평문" in result.summary
